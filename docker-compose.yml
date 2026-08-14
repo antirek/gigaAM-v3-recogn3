@@ -1,0 +1,41 @@
+version: "2.3"
+
+services:
+  diar:
+    build:
+      context: ./diar
+    image: gigaam-recogn2-diar:latest
+    runtime: nvidia
+    environment:
+      HF_HOME: /data/models/hf
+      TORCH_HOME: /data/models/torch
+      NEMO_CACHE_DIR: /data/models/nemo
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      DIAR_MODEL: ${DIAR_MODEL:-nvidia/diar_streaming_sortformer_4spk-v2.1}
+      DIAR_NEMO_PATH: ${DIAR_NEMO_PATH:-}
+      DIAR_CHUNK_LEN: ${DIAR_CHUNK_LEN:-340}
+      DIAR_RIGHT_CONTEXT: ${DIAR_RIGHT_CONTEXT:-40}
+      DIAR_FIFO_LEN: ${DIAR_FIFO_LEN:-40}
+      DIAR_UPDATE_PERIOD: ${DIAR_UPDATE_PERIOD:-340}
+      DIAR_SPKCACHE_LEN: ${DIAR_SPKCACHE_LEN:-188}
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - ./data:/data
+      - ./out:/out
+    working_dir: /work
+
+  asr:
+    build:
+      context: ./asr
+    image: gigaam-recogn2-asr:latest
+    runtime: nvidia
+    environment:
+      GIGAAM_CACHE: /data/models/gigaam
+      GIGAAM_MODEL: ${GIGAAM_MODEL:-v3_e2e_rnnt}
+      DEVICE: cuda
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - ./data:/data
+      - ./out:/out
+    working_dir: /work
