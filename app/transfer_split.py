@@ -10,14 +10,14 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 Segment = dict  # {start, end, speaker}
 
 
-# Transfer-specific only (avoid IVR: «оставайтесь на линии», «первый свободный»).
+# Transfer phrases. «соедин» covers соединить/соединяю/соединим.
+# Avoid bare IVR «оставайтесь на линии» / «первый свободный» alone.
 DEFAULT_TRANSFER_CUES = (
     r"перевед",
     r"переключ",
-    r"соединяю",
-    r"соединим",
+    r"соедин",
     r"передам\s+(вас|ваш)",
-    r"сейчас\s+соедин",
+    r"оставайтесь\s+на\s+линии",
 )
 
 
@@ -111,53 +111,76 @@ def find_transfer_split(
 ) -> Optional[dict]:
     """Pick a split time for re-diarization around a likely transfer.
 
-    Prefer: first long gap that starts after a transfer-cue utterance.
-    Fallback: longest mid-call gap (not near edges).
-    Also returns dialog_start (skip IVR) for a cleaner head clip.
+    Prefer: last hold gap in window after a transfer cue.
+    Else: soft gap (≥1.5s) after cue, or split just after the cue itself
+    (cold transfer with almost no silence).
+    Fallback without cue: longest mid-call gap (optional, often noisy).
     """
     if audio_end is None and raw_segments:
         audio_end = max(float(s["end"]) for s in raw_segments)
     audio_end = float(audio_end or 0.0)
     gaps = find_gaps(raw_segments, min_gap=min_gap)
-    # keep gaps away from edges
+    soft_gaps = find_gaps(raw_segments, min_gap=1.5)
     mid_gaps = [
         g
         for g in gaps
         if g[0] >= margin_sec and (audio_end <= 0 or g[1] <= audio_end - margin_sec)
     ]
-    if not mid_gaps and not gaps:
-        return None
 
     hits = cue_times(utterances, cues)
     chosen = None
     reason = ""
+    split_t: Optional[float] = None
     hold_window = float(os.getenv("TRANSFER_HOLD_WINDOW_SEC", "60"))
-    if hits and mid_gaps:
-        cue_t = min(hits)
+    allow_gap_only = os.getenv("TRANSFER_GAP_ONLY", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    if hits:
+        cue_t = max(hits)  # last transfer phrase (often «оставайтесь на линии»)
         after = [
             g
             for g in mid_gaps
             if g[0] >= cue_t - 1.0 and g[0] <= cue_t + hold_window
         ]
         if after:
-            # Prefer the *last* hold gap in the window after the cue
-            # (end of music-on-hold), not a later mid-call pause.
             chosen = after[-1]
             reason = f"last_gap_after_cue@{cue_t:.1f}s"
-    if chosen is None and mid_gaps:
+        if chosen is None:
+            soft_after = [
+                g
+                for g in soft_gaps
+                if g[0] >= cue_t - 0.5 and g[0] <= cue_t + hold_window
+            ]
+            if soft_after:
+                chosen = soft_after[0]
+                reason = f"soft_gap_after_cue@{cue_t:.1f}s"
+        if chosen is None:
+            # Cold transfer: almost no silence — cut shortly after the cue.
+            split_t = min(cue_t + 0.4, audio_end - 5.0) if audio_end > cue_t + 10 else None
+            if split_t is not None and split_t > margin_sec:
+                reason = f"cue_only@{cue_t:.1f}s"
+                chosen = (split_t, split_t, 0.0)
+
+    if chosen is None and allow_gap_only and mid_gaps:
         chosen = max(mid_gaps, key=lambda g: g[2])
         reason = "longest_mid_gap"
     if chosen is None:
         return None
 
     gap_start, gap_end, gap_dur = chosen
-    split_t = (gap_start + gap_end) / 2.0
+    if split_t is None:
+        split_t = (gap_start + gap_end) / 2.0 if gap_dur > 0 else gap_start
+    # Need enough audio on both sides to re-diarize.
+    if split_t < 8.0 or (audio_end > 0 and audio_end - split_t < 8.0):
+        return None
     dialog_start = find_dialog_start(raw_segments)
-    # Head must be long enough to re-diarize.
     if dialog_start >= split_t - 5.0:
         dialog_start = 0.0
     return {
-        "split_t": split_t,
+        "split_t": float(split_t),
         "dialog_start": dialog_start,
         "gap_start": gap_start,
         "gap_end": gap_end,

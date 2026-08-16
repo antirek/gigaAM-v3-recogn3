@@ -270,6 +270,12 @@ def _maybe_transfer_rediar(
         json.dumps(meta, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    # Docker may leave diar.raw.json as root; unlink then rewrite as host user.
+    if diar_raw.is_file():
+        try:
+            diar_raw.unlink()
+        except OSError:
+            pass
     diar_raw.write_text(
         json.dumps(
             {"segments": stitched, "transfer_split": meta},
