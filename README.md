@@ -19,6 +19,10 @@ docker-compose build
 
 # Прогон
 python3 recognize.py --audio data/mono3.wav --out out/mono3
+
+# Опционально: второй проход Qwen3-ASR (соседний ../qwen3-asr-campplus)
+# → transcript_qwen.txt + dual_for_llm.md (два диалога рядом для LLM)
+python3 recognize.py --audio data/mono3.wav --out out/mono3 --dual-qwen
 ```
 
 Результат: `out/mono3/transcript.txt`
@@ -29,6 +33,7 @@ python3 recognize.py --audio data/mono3.wav --out out/mono3
 ```
 
 Также: `diar.raw.json`, `segments.json`, `transcript.json`.
+С `--dual-qwen`: `transcript_qwen.txt`, `asr_qwen.json`, `dual_for_llm.md` (GigaAM и Qwen рядом для компиляции через LLM).
 
 ## Архитектура
 
@@ -54,6 +59,9 @@ python3 recognize.py --audio data/mono3.wav --out out/mono3
 - `AUDIO_HIGHPASS_HZ` — default `80`
 - `MERGE_GAP_SEC` — склейка соседних реплик одного спикера (default `1.2`)
 - `MIN_SEGMENT_SEC` (default `0.35`)
+- `MAX_SPEAKERS` — потолок спикеров после diar (default `4`; Sortformer до 4)
+- `MIN_SPK_SEC` / `MIN_SPK_SHARE` — 3-й/4-й спикер только если речь ≥ N сек и доля ≥ share (переводы; default `10` / `0.06`). Топ-2 всегда остаются.
+- `TRANSFER_SPLIT` — после черновика ASR: cue («переведу»…) + hold → re-diar head/tail (default `1`; выкл: `0` или `--no-transfer-split`)
 - `MAX_ASR_SEC` — нарезка длинных реплик по паузам diar (default `20`)
 - `DIAR_MODEL` — по умолчанию `nvidia/diar_streaming_sortformer_4spk-v2.1`
 - `DIAR_CHUNK_LEN` и др. — streaming-конфиг Sortformer (very high latency)

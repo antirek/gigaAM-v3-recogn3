@@ -12,20 +12,64 @@ def _duration(seg: Segment) -> float:
     return max(0.0, float(seg["end"]) - float(seg["start"]))
 
 
-def keep_top_speakers(segments: list[Segment], max_speakers: int = 2) -> list[Segment]:
+def keep_top_speakers(
+    segments: list[Segment],
+    max_speakers: int = 4,
+    *,
+    min_spk_sec: float = 10.0,
+    min_spk_share: float = 0.06,
+) -> list[Segment]:
+    """Keep main speakers; allow 3rd/4th only if they look like a real party.
+
+    Always keeps the top-2 by total speech duration (typical 2-party call).
+    Extra speakers (transfers) are kept only when both:
+      - cumulative duration >= min_spk_sec
+      - share of all speech >= min_spk_share
+    up to max_speakers (Sortformer is 4-spk).
+    """
+    if max_speakers <= 0 or not segments:
+        return [dict(s) for s in segments]
+
     totals: dict[int, float] = {}
     for seg in segments:
         spk = int(seg["speaker"])
         totals[spk] = totals.get(spk, 0.0) + _duration(seg)
-    if len(totals) <= max_speakers:
-        return segments
-    keep = {
-        spk
-        for spk, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[
-            :max_speakers
-        ]
-    }
-    return [s for s in segments if int(s["speaker"]) in keep]
+
+    if len(totals) <= 1:
+        return [dict(s) for s in segments]
+
+    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+    total_speech = sum(totals.values()) or 1.0
+
+    # Always keep the two longest talkers when present.
+    keep: set[int] = {spk for spk, _ in ranked[: min(2, len(ranked))]}
+
+    for spk, dur in ranked[2:]:
+        if len(keep) >= max_speakers:
+            break
+        share = dur / total_speech
+        if dur >= min_spk_sec and share >= min_spk_share:
+            keep.add(spk)
+
+    dropped = sorted(set(totals) - keep)
+    if dropped:
+        detail = ", ".join(
+            f"{spk}:{totals[spk]:.1f}s/{totals[spk] / total_speech:.0%}" for spk in dropped
+        )
+        print(
+            f"[align] drop speakers [{detail}] "
+            f"(keep={sorted(keep)}, max={max_speakers}, "
+            f"min_sec={min_spk_sec:g}, min_share={min_spk_share:g})",
+            flush=True,
+        )
+    elif len(keep) > 2:
+        print(
+            f"[align] keep speakers {sorted(keep)} "
+            f"(extras passed min_sec={min_spk_sec:g} min_share={min_spk_share:g})",
+            flush=True,
+        )
+
+    return [dict(s) for s in segments if int(s["speaker"]) in keep]
 
 
 def remap_speakers(segments: list[Segment]) -> list[Segment]:
@@ -276,9 +320,11 @@ def join_texts_by_utterance(items: list[dict]) -> list[dict]:
 def prepare_segments(
     segments: Iterable[Segment],
     *,
-    max_speakers: int = 2,
+    max_speakers: int = 4,
     merge_gap: float = 0.5,
     min_segment: float = 0.35,
+    min_spk_sec: float = 10.0,
+    min_spk_share: float = 0.06,
 ) -> Tuple[List[Segment], List[Segment]]:
     """Return (atomics, turns).
 
@@ -290,7 +336,12 @@ def prepare_segments(
         s["start"] = float(s["start"])
         s["end"] = float(s["end"])
         s["speaker"] = int(s["speaker"])
-    segs = keep_top_speakers(segs, max_speakers=max_speakers)
+    segs = keep_top_speakers(
+        segs,
+        max_speakers=max_speakers,
+        min_spk_sec=min_spk_sec,
+        min_spk_share=min_spk_share,
+    )
     segs = resolve_overlaps(segs)
     segs = absorb_short_interruptions(segs)
     segs = drop_short(segs, min_sec=min_segment)
@@ -303,14 +354,18 @@ def prepare_segments(
 def postprocess(
     segments: Iterable[Segment],
     *,
-    max_speakers: int = 2,
+    max_speakers: int = 4,
     merge_gap: float = 0.5,
     min_segment: float = 0.35,
+    min_spk_sec: float = 10.0,
+    min_spk_share: float = 0.06,
 ) -> list[Segment]:
     _, turns = prepare_segments(
         segments,
         max_speakers=max_speakers,
         merge_gap=merge_gap,
         min_segment=min_segment,
+        min_spk_sec=min_spk_sec,
+        min_spk_share=min_spk_share,
     )
     return turns
