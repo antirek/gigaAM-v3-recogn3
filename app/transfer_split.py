@@ -108,13 +108,17 @@ def find_transfer_split(
     cues: Sequence[str] = DEFAULT_TRANSFER_CUES,
     margin_sec: float = 15.0,
     audio_end: Optional[float] = None,
+    audio_holds: Sequence[dict] = (),
 ) -> Optional[dict]:
     """Pick a split time for re-diarization around a likely transfer.
 
-    Prefer: last hold gap in window after a transfer cue.
-    Else: soft gap (≥1.5s) after cue, or split just after the cue itself
-    (cold transfer with almost no silence).
-    Fallback without cue: longest mid-call gap (optional, often noisy).
+    Priority when cue present:
+      1. audio hold (silence/music VAD) after cue
+      2. long diar gap after cue
+      3. soft diar gap after cue
+      4. cue_only (cold transfer)
+    Optional: long audio hold without cue (TRANSFER_HOLD_ONLY=1).
+    Optional: longest diar gap without cue (TRANSFER_GAP_ONLY=1).
     """
     if audio_end is None and raw_segments:
         audio_end = max(float(s["end"]) for s in raw_segments)
@@ -127,27 +131,57 @@ def find_transfer_split(
         if g[0] >= margin_sec and (audio_end <= 0 or g[1] <= audio_end - margin_sec)
     ]
 
+    hold_gaps: List[Tuple[float, float, float, str]] = []
+    for h in audio_holds:
+        start_h, end_h = float(h["start"]), float(h["end"])
+        dur = float(h.get("dur") or (end_h - start_h))
+        kind = str(h.get("kind") or "silence")
+        if start_h < margin_sec:
+            continue
+        if audio_end > 0 and end_h > audio_end - margin_sec:
+            continue
+        if dur < min_gap * 0.6:
+            continue
+        hold_gaps.append((start_h, end_h, dur, kind))
+
     hits = cue_times(utterances, cues)
     chosen = None
     reason = ""
     split_t: Optional[float] = None
+    hold_kind: Optional[str] = None
     hold_window = float(os.getenv("TRANSFER_HOLD_WINDOW_SEC", "60"))
     allow_gap_only = os.getenv("TRANSFER_GAP_ONLY", "0").lower() in {
         "1",
         "true",
         "yes",
     }
+    allow_hold_only = os.getenv("TRANSFER_HOLD_ONLY", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
     if hits:
-        cue_t = max(hits)  # last transfer phrase (often «оставайтесь на линии»)
-        after = [
+        cue_t = max(hits)
+        audio_after = [
             g
-            for g in mid_gaps
+            for g in hold_gaps
             if g[0] >= cue_t - 1.0 and g[0] <= cue_t + hold_window
         ]
-        if after:
-            chosen = after[-1]
-            reason = f"last_gap_after_cue@{cue_t:.1f}s"
+        if audio_after:
+            pick = audio_after[-1]
+            chosen = (pick[0], pick[1], pick[2])
+            hold_kind = pick[3]
+            reason = f"audio_{hold_kind}_after_cue@{cue_t:.1f}s"
+        if chosen is None:
+            after = [
+                g
+                for g in mid_gaps
+                if g[0] >= cue_t - 1.0 and g[0] <= cue_t + hold_window
+            ]
+            if after:
+                chosen = after[-1]
+                reason = f"last_gap_after_cue@{cue_t:.1f}s"
         if chosen is None:
             soft_after = [
                 g
@@ -158,12 +192,18 @@ def find_transfer_split(
                 chosen = soft_after[0]
                 reason = f"soft_gap_after_cue@{cue_t:.1f}s"
         if chosen is None:
-            # Cold transfer: almost no silence — cut shortly after the cue.
-            split_t = min(cue_t + 0.4, audio_end - 5.0) if audio_end > cue_t + 10 else None
+            split_t = (
+                min(cue_t + 0.4, audio_end - 5.0) if audio_end > cue_t + 10 else None
+            )
             if split_t is not None and split_t > margin_sec:
                 reason = f"cue_only@{cue_t:.1f}s"
                 chosen = (split_t, split_t, 0.0)
 
+    if chosen is None and allow_hold_only and hold_gaps:
+        pick = max(hold_gaps, key=lambda g: g[2])
+        chosen = (pick[0], pick[1], pick[2])
+        hold_kind = pick[3]
+        reason = f"audio_{hold_kind}_only"
     if chosen is None and allow_gap_only and mid_gaps:
         chosen = max(mid_gaps, key=lambda g: g[2])
         reason = "longest_mid_gap"
@@ -173,7 +213,6 @@ def find_transfer_split(
     gap_start, gap_end, gap_dur = chosen
     if split_t is None:
         split_t = (gap_start + gap_end) / 2.0 if gap_dur > 0 else gap_start
-    # Need enough audio on both sides to re-diarize.
     if split_t < 8.0 or (audio_end > 0 and audio_end - split_t < 8.0):
         return None
     dialog_start = find_dialog_start(raw_segments)
@@ -187,6 +226,8 @@ def find_transfer_split(
         "gap_dur": gap_dur,
         "reason": reason,
         "cue_hits": hits,
+        "hold_kind": hold_kind,
+        "audio_holds_n": len(hold_gaps),
     }
 
 
@@ -215,6 +256,33 @@ def _remap_local(segments: Sequence[Segment]) -> List[Segment]:
     return out
 
 
+def _first_real_tail_speaker(
+    tail: Sequence[Segment],
+    *,
+    resume_t: float,
+    min_seg_sec: float = 0.85,
+) -> Optional[int]:
+    """Speaker of the first solid turn after hold (skip ringback beeps)."""
+    candidates = [
+        s
+        for s in tail
+        if float(s["end"]) >= resume_t
+        and _dur(s) >= min_seg_sec
+        and float(s["start"]) >= resume_t - 0.35
+    ]
+    if not candidates:
+        # Soft fallback: any long-enough segment that overlaps/after resume.
+        candidates = [
+            s
+            for s in tail
+            if float(s["end"]) >= resume_t and _dur(s) >= min_seg_sec
+        ]
+    if not candidates:
+        return None
+    first = min(candidates, key=lambda s: (float(s["start"]), float(s["end"])))
+    return int(first["speaker"])
+
+
 def stitch_diar_parts(
     head: Sequence[Segment],
     tail: Sequence[Segment],
@@ -223,10 +291,13 @@ def stitch_diar_parts(
     head_offset: float = 0.0,
     continuity: str = "longest",
     lead_segments: Sequence[Segment] = (),
+    resume_t: Optional[float] = None,
 ) -> List[Segment]:
     """Combine optional lead (IVR) + head + tail diar.
 
-    Continuity maps longest tail spk → longest head spk (usually the customer).
+    Continuity maps continuing customer in tail → longest head spk.
+    With continuity=first_new, the first *real* post-hold voice is the new agent
+    (hold beeps before resume_t are ignored for that decision and dropped).
     lead_segments keep their speaker ids and are prepended as-is.
     """
     head_l = _remap_local(head)
@@ -234,10 +305,17 @@ def stitch_diar_parts(
         s["start"] = float(s["start"]) + head_offset
         s["end"] = float(s["end"]) + head_offset
 
+    # Absolute time when post-hold dialogue resumes (end of audio hold / gap).
+    resume_abs = float(resume_t) if resume_t is not None else float(split_t)
+
     tail_l = _remap_local(tail)
     for s in tail_l:
         s["start"] = float(s["start"]) + split_t
         s["end"] = float(s["end"]) + split_t
+
+    # Drop hold/ringback crumbs before dialogue resumes.
+    if resume_abs > split_t + 0.5:
+        tail_l = [s for s in tail_l if float(s["end"]) > resume_abs - 0.15]
 
     lead = [dict(s) for s in lead_segments]
     lead_ids = {int(s["speaker"]) for s in lead}
@@ -262,11 +340,8 @@ def stitch_diar_parts(
     used = set(lead_ids) | set(head_tot)
     next_id = (max(used) + 1) if used else 0
 
-    # Who speaks first in the tail (after hold) is usually the *new* agent.
-    first_tail = None
-    if tail_l:
-        first_seg = min(tail_l, key=lambda s: (float(s["start"]), float(s["end"])))
-        first_tail = int(first_seg["speaker"])
+    # Who speaks first after hold is usually the *new* agent — not beep spikes.
+    first_tail = _first_real_tail_speaker(tail_l, resume_t=resume_abs)
 
     tail_map: Dict[int, int] = {}
     if continuity in {"longest", "first_new"} and head_ids and tail_ids:

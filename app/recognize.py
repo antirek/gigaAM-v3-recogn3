@@ -14,6 +14,7 @@ from typing import List, Sequence
 from .align import join_texts_by_utterance, pack_asr_chunks, prepare_segments
 from .preprocess import cut_segment, enhance_mode_from_env, ensure_wav_16k_mono, format_ts
 from .qwen_dual import run_qwen_dual
+from .hold_detect import detect_hold_intervals
 from .transfer_split import (
     DEFAULT_TRANSFER_CUES,
     find_transfer_split,
@@ -192,6 +193,29 @@ def _maybe_transfer_rediar(
         else list(DEFAULT_TRANSFER_CUES)
     )
     audio_end = wav_duration_sec(wav16)
+    audio_holds: List[dict] = []
+    if _env_bool("TRANSFER_AUDIO_HOLD", True):
+        min_hold = float(os.getenv("TRANSFER_AUDIO_HOLD_SEC", "5"))
+        try:
+            audio_holds = detect_hold_intervals(wav16, min_hold_sec=min_hold)
+            print(
+                f"[orch] audio-hold: {len(audio_holds)} intervals "
+                f"(≥{min_hold:.0f}s silence/music)",
+                flush=True,
+            )
+            for h in audio_holds[:8]:
+                print(
+                    f"  hold {h['kind']} {h['start']:.1f}-{h['end']:.1f} "
+                    f"({h['dur']:.1f}s)",
+                    flush=True,
+                )
+            (out_dir / "hold_detect.json").write_text(
+                json.dumps({"intervals": audio_holds}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"[orch] audio-hold failed: {exc}", flush=True)
+
     info = find_transfer_split(
         raw_segments=raw_segments,
         utterances=transcript,
@@ -199,6 +223,7 @@ def _maybe_transfer_rediar(
         cues=cues,
         margin_sec=margin,
         audio_end=audio_end,
+        audio_holds=audio_holds,
     )
     if not info:
         stale = out_dir / "transfer_split.json"
@@ -249,6 +274,8 @@ def _maybe_transfer_rediar(
             if float(s["end"]) <= dialog_start + 0.05
         ]
 
+    # Resume after hold/gap so ringback beeps are not treated as the new agent.
+    resume_t = float(info.get("gap_end") or split_t)
     stitched = stitch_diar_parts(
         head_segs,
         tail_segs,
@@ -256,6 +283,7 @@ def _maybe_transfer_rediar(
         head_offset=dialog_start,
         continuity=continuity,
         lead_segments=lead_segs,
+        resume_t=resume_t,
     )
     spk_ids = sorted({int(s["speaker"]) for s in stitched})
     print(

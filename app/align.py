@@ -89,14 +89,14 @@ def remap_speakers(segments: list[Segment]) -> list[Segment]:
 
 
 def resolve_overlaps(segments: list[Segment]) -> list[Segment]:
-    """Make timeline non-overlapping; dominant = longer total speech wins ties by start."""
+    """Make timeline non-overlapping for ASR cuts.
+
+    On cross-speaker overlap the *later* segment owns the overlap; the earlier
+    speaker may keep a tail after it. (Previously the longer-talker kept the
+    full span, so short «до свидания» rode inside the other party's ASR chunk.)
+    """
     if not segments:
         return []
-
-    totals: dict[int, float] = {}
-    for seg in segments:
-        spk = int(seg["speaker"])
-        totals[spk] = totals.get(spk, 0.0) + _duration(seg)
 
     sorted_segs = sorted(
         segments,
@@ -114,28 +114,45 @@ def resolve_overlaps(segments: list[Segment]) -> list[Segment]:
             continue
 
         prev = result[-1]
-        if start >= prev["end"]:
+        if start >= float(prev["end"]) - 1e-4:
             result.append({"start": start, "end": end, "speaker": spk})
             continue
 
         # Overlap with previous
-        if spk == prev["speaker"]:
-            prev["end"] = max(prev["end"], end)
+        if spk == int(prev["speaker"]):
+            prev["end"] = max(float(prev["end"]), end)
             continue
 
+        prev_end = float(prev["end"])
+        prev_spk = int(prev["speaker"])
         overlap_start = start
-        # Prefer speaker with more total duration; tie → keep previous (earlier arrival)
-        if totals.get(spk, 0.0) > totals.get(prev["speaker"], 0.0):
-            if overlap_start > prev["start"]:
-                prev["end"] = overlap_start
-            else:
-                result.pop()
-            if end > overlap_start:
-                result.append({"start": overlap_start, "end": end, "speaker": spk})
+
+        if overlap_start > float(prev["start"]) + 1e-4:
+            prev["end"] = overlap_start
         else:
-            if end > prev["end"]:
-                result.append({"start": prev["end"], "end": end, "speaker": spk})
-        result = [s for s in result if s["end"] > s["start"] + 1e-4]
+            result.pop()
+
+        if end > overlap_start + 1e-4:
+            result.append({"start": overlap_start, "end": end, "speaker": spk})
+        if prev_end > end + 1e-4:
+            result.append({"start": end, "end": prev_end, "speaker": prev_spk})
+
+        # Keep chronological order when a tail was re-inserted.
+        result.sort(
+            key=lambda s: (float(s["start"]), float(s["end"]), int(s["speaker"]))
+        )
+        # Merge adjacent same-speaker crumbs created by splits.
+        merged: list[Segment] = []
+        for item in result:
+            if (
+                merged
+                and int(merged[-1]["speaker"]) == int(item["speaker"])
+                and float(item["start"]) <= float(merged[-1]["end"]) + 1e-4
+            ):
+                merged[-1]["end"] = max(float(merged[-1]["end"]), float(item["end"]))
+            else:
+                merged.append(dict(item))
+        result = [s for s in merged if float(s["end"]) > float(s["start"]) + 1e-4]
 
     return result
 
@@ -158,10 +175,16 @@ def merge_same_speaker(segments: list[Segment], gap: float = 0.5) -> list[Segmen
 
 def absorb_short_interruptions(
     segments: list[Segment],
-    max_frag: float = 0.7,
-    max_gap: float = 0.45,
+    max_frag: float = 0.28,
+    max_gap: float = 0.25,
 ) -> list[Segment]:
-    """Reattach a short opposite-speaker blip to surrounding speaker."""
+    """Drop tiny opposite-speaker crumbs (clicks/bleed), keep real backchannels.
+
+    Previously max_frag≈0.7 ate «да»/«угу» between agent turns and merged them
+    into one ASR chunk («…зовут? Да. Вы хотите…»). Only absorb sub-~0.3s blips
+    fully enclosed by the same speaker; never extend the previous span over the
+    blip (that would put foreign audio into the wrong ASR cut).
+    """
     if len(segments) < 2:
         return segments
     out = [dict(segments[0])]
@@ -171,20 +194,17 @@ def absorb_short_interruptions(
         prev = out[-1]
         dur = _duration(cur)
         gap = float(cur["start"]) - float(prev["end"])
+        nxt = segments[i + 1] if i + 1 < len(segments) else None
         if (
-            int(cur["speaker"]) != int(prev["speaker"])
+            nxt is not None
+            and int(cur["speaker"]) != int(prev["speaker"])
+            and int(nxt["speaker"]) == int(prev["speaker"])
             and dur <= max_frag
             and 0 <= gap <= max_gap
         ):
-            nxt = segments[i + 1] if i + 1 < len(segments) else None
-            if nxt is not None and int(nxt["speaker"]) == int(prev["speaker"]):
-                prev["end"] = max(float(prev["end"]), float(cur["end"]))
-                i += 1
-                continue
-            if _duration(prev) >= 1.0:
-                prev["end"] = max(float(prev["end"]), float(cur["end"]))
-                i += 1
-                continue
+            # Skip crumb; next same-speaker turn may merge across via merge_gap.
+            i += 1
+            continue
         out.append(cur)
         i += 1
     return out
