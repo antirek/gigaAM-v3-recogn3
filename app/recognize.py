@@ -201,6 +201,9 @@ def _maybe_transfer_rediar(
         audio_end=audio_end,
     )
     if not info:
+        stale = out_dir / "transfer_split.json"
+        if stale.is_file():
+            stale.unlink()
         print("[orch] transfer-split: no split point", flush=True)
         return raw_segments
 
