@@ -150,11 +150,25 @@ def _render_call_summary_md(summary: Dict[str, Any]) -> str:
     lines.append("## Issues detected")
     for it in summary.get("issues_detected") or []:
         sev = it.get("severity") or "med"
-        lines.append(f"- ({sev}) {it.get('issue')}: {it.get('evidence')}")
+        issue = it.get("issue") or ""
+        evidence = (it.get("evidence") or "").strip()
+        if evidence:
+            lines.append(f"- ({sev}) {issue}: {evidence}")
+        else:
+            lines.append(f"- ({sev}) {issue}")
     lines.append("")
     lines.append("## Actions")
     for a in summary.get("actions") or []:
-        lines.append(f"- {a.get('who')}: {a.get('action')} ({a.get('deadline') or 'no deadline'})")
+        who = (a.get("who") or "").strip()
+        action = (a.get("action") or "").strip()
+        deadline = a.get("deadline")
+        if deadline is None or (isinstance(deadline, str) and not deadline.strip()):
+            deadline_txt = "no deadline"
+        else:
+            deadline_txt = str(deadline)
+
+        prefix = f"{who}: " if who else ""
+        lines.append(f"- {prefix}{action} ({deadline_txt})")
     return "\n".join(lines).rstrip() + "\n"
 
 

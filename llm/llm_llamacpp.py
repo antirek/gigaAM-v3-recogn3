@@ -812,23 +812,37 @@ def _refine_transcript_llamacpp_smart(transcript_text: str) -> Tuple[str, List[d
 def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, Any]:
     system = (
         "You are a Russian customer-call analyst. Return raw JSON only. "
-        "Use only facts present in the transcript."
+        "Use only facts present in the transcript. "
+        "Fill evidence fields with short exact quotes from the transcript (non-empty when the item exists). "
+        "Prefer 2-3 high-signal items instead of many low-signal ones. "
+        "IMPORTANT: The `intent` field must be a Russian narrative summary of 2-3 sentences "
+        "(not a short label). It should say what the caller wants and what happens next."
     )
     user = (
         f"call_id: {call_id}\n\n"
         f"Transcript:\n{transcript_text}\n\n"
         "Return one JSON object with keys: call_id, language, participants, intent, topics, "
-        "timeline, entities, actions, issues_detected, quality_notes."
+        "timeline, entities, actions, issues_detected, quality_notes.\n\n"
+        "Output requirements:\n"
+        "- intent: 2-3 sentences in Russian (include what requested + next step/expected outcome).\n"
+        "- topics: 2..4 items max, short Russian phrases (no long explanations).\n"
+        "- timeline: 4..8 events max; each event has a t_hint (best-effort) and a concrete short description.\n"
+        "- issues_detected: 2..3 items; each item MUST include a short non-empty `evidence` quote.\n"
+        "- actions: 2..4 items; `who` MUST be either `agent` or `client` (based on participants in the transcript).\n"
+        "- If you cannot provide a non-empty `evidence` quote for an issue, then omit that issue item instead of leaving evidence empty.\n"
+        "- If you are unsure who does an action, prefer the more likely side from transcript roles_guess.\n"
+        "- entities: only list what is explicitly present in the transcript (empty lists are OK)."
     )
     payload = _chat_json(
         system=system,
         user=user,
-        max_tokens=640,
+        max_tokens=1100,
         schema=CallSummaryResponse,
         schema_name="call_summary",
     )
     payload.pop("_llm_format", None)
-    payload.setdefault("call_id", call_id)
+    # The model may accidentally put additional text into call_id; trust caller-provided value.
+    payload["call_id"] = call_id
     payload.setdefault("language", "ru")
     payload.setdefault("participants", {"speakers": [], "roles_guess": {"agent": None, "client": None, "manager": None}})
     payload.setdefault("topics", [])
@@ -840,6 +854,54 @@ def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, 
     payload.setdefault("actions", [])
     payload.setdefault("issues_detected", [])
     payload.setdefault("quality_notes", {"has_transfer": False, "transfer_reason": None, "asr_uncertainty": None})
+
+    # Post-process: make intent a more narrative 2-3 sentence summary.
+    # LLM sometimes outputs a short label even when asked for sentences.
+    try:
+        orig_intent = str(payload.get("intent") or "").strip()
+        topics = [str(t).strip() for t in (payload.get("topics") or []) if str(t).strip()]
+        actions = payload.get("actions") or []
+
+        # Detect "already sentence-like" intent: contains punctuation end marks.
+        has_sentence_punct = bool(re.search(r"[.!?]\s*$", orig_intent)) or bool(re.search(r"[.!?]", orig_intent))
+
+        # If intent is very short, expand it using topics/actions.
+        if orig_intent and (not has_sentence_punct or len(orig_intent) < 60):
+            topics_short = ", ".join(topics[:2]) if topics else ""
+            next_parts: List[str] = []
+            for a in actions[:2]:
+                if not isinstance(a, dict):
+                    continue
+                act = str(a.get("action") or "").strip()
+                dl = a.get("deadline")
+                if not act:
+                    continue
+                dl_s = None if dl is None else str(dl).strip()
+                if not dl_s:
+                    next_parts.append(act)
+                elif dl_s == "during_call":
+                    next_parts.append(f"{act} (в ходе звонка)")
+                elif dl_s == "немедленно" or dl_s == "immediate":
+                    next_parts.append(f"{act} (немедленно)")
+                elif re.match(r"^\d{2}:\d{2}$", dl_s):
+                    next_parts.append(f"{act} (в {dl_s})")
+                else:
+                    next_parts.append(f"{act} ({dl_s})")
+
+            next_txt = "; ".join(next_parts) if next_parts else ""
+            base = orig_intent.rstrip(".")
+            if topics_short and next_txt:
+                payload["intent"] = f"{base}. Ключевые моменты: {topics_short}. Далее: {next_txt}."
+            elif topics_short:
+                payload["intent"] = f"{base}. Ключевые моменты: {topics_short}."
+            elif next_txt:
+                payload["intent"] = f"{base}. Далее: {next_txt}."
+            else:
+                payload["intent"] = f"{base}."
+    except Exception:
+        # Keep whatever the model produced.
+        pass
+
     return payload
 
 
