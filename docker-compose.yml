@@ -11,7 +11,7 @@ services:
       TORCH_HOME: /data/models/torch
       NEMO_CACHE_DIR: /data/models/nemo
       HF_TOKEN: ${HF_TOKEN:-}
-      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
       DIAR_MODEL: ${DIAR_MODEL:-nvidia/diar_streaming_sortformer_4spk-v2.1}
       DIAR_NEMO_PATH: ${DIAR_NEMO_PATH:-}
       DIAR_CHUNK_LEN: ${DIAR_CHUNK_LEN:-340}
@@ -39,3 +39,49 @@ services:
       - ./data:/data
       - ./out:/out
     working_dir: /work
+
+  llm:
+    build:
+      context: ./llm
+    image: gigaam-recogn2-llm:latest
+    runtime: nvidia
+    environment:
+      LLM_BACKEND: llamacpp
+      LLM_FALLBACK_TO_RULES: "1"
+      LLAMACPP_URL: http://llamacpp:8000/v1
+      LLAMACPP_MODEL: T-lite-it-2.1-q8_0
+      LLAMACPP_MAX_TOKENS: "2048"
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - ./data:/data
+      - ./out:/out
+    working_dir: /work
+
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    runtime: nvidia
+    command:
+      - -m
+      - /models/T-lite-it-2.1-Q8_0.gguf
+      - --alias
+      - T-lite-it-2.1-q8_0
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - -ngl
+      - "99"
+      - -c
+      - "16384"
+      - -np
+      - "1"
+      - --jinja
+      - -fa
+      - "on"
+      - --temp
+      - "0"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - ./data/models/llamacpp:/models:ro
+
