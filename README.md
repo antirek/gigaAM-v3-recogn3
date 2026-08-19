@@ -147,3 +147,171 @@ python3 recognize.py --audio … --out … --no-transfer-split
 
 - GigaAM: `data/models/gigaam/`
 - HuggingFace / NeMo: `data/models/hf`, `data/models/nemo`
+
+## Пост-обработка текста (LLM/LLM-free извлечение фактов)
+
+После `recognize.py` у нас уже есть `out/<id>/transcript.txt` в формате:
+
+```text
+[MM:SS] Спикер N: ...
+```
+
+Дальше работает отдельный блок в `./llm/` (контейнер сервиса `llm` + `llamacpp` в compose).
+
+### Какие модели сейчас используются
+
+#### Llama.cpp runtime (опционально, для ролей/обязательств)
+
+`docker-compose.yml` на сервисе `llamacpp` стартует:
+
+- GGUF: `data/models/llamacpp/T-lite-it-2.1-Q8_0.gguf`
+- Served name/alias: `T-lite-it-2.1-q8_0`
+
+`llm` (клиент) использует:
+- `LLM_BACKEND=llamacpp`
+- `LLAMACPP_MODEL=T-lite-it-2.1-q8_0`
+
+Почему llama.cpp:
+- vLLM убран: на `refine`/JSON schema он давал нестабильный JSON (пустые/обрывающиеся `splits` и раздувание структуры под `max_tokens`).
+
+#### Детерминированный слой Natasha (LLM-free, факты)
+
+Мы добавили локальный модуль Natasha для извлечения **фактов** без LLM:
+- телефоны (через сбор диктовки + валидацию формата)
+- адреса
+- суммы денег
+
+LLM при этом остаётся для:
+- ролей спикеров (`ivr/client/agent`)
+- обязательств/обещаний (commitments)
+
+### CLI в `llm/`
+
+Главный вход — `llm/llm_cli.py` (в контейнере это `python3 /work/llm/llm_cli.py`).
+
+1) `refine`
+- Упрощает/нормализует `transcript.txt` детерминированными правилами (пунктуация/пробелы/мелкие правки).
+- Команда: `python3 llm/llm_cli.py refine --input ... --output ... --debug-output ...`
+
+2) `extract` (LLM, full schema)
+- Извлекает `phones`, `addresses`, `amounts`, `commitments`.
+- Важно: после ответа LLM в Python есть строгая `sanitize`: телефоны фильтруются regex + “grounding” по цифрам в исходном транскрипте.
+- Команда:
+  - `python3 llm/llm_cli.py extract --input ... --output ... --call-id ...`
+
+3) `extract-natasha` (LLM-free facts)
+- Вытаскивает только `phones`, `addresses`, `amounts`.
+- `commitments` не заполняются (это остаётся под LLM).
+- Команда:
+  - `python3 llm/llm_cli.py extract-natasha --input ... --output ... --call-id ...`
+
+4) `roles` (LLM)
+- LLM-этикетка ролей по репликам: `ivr | client | agent | unknown`.
+- Результат потом санитарится: “лишние” спикеры выкидываются, роли ограничены whitelist.
+- Команда:
+  - `python3 llm/llm_cli.py roles --input ... --output ... --call-id ...`
+
+5) `extract-hybrid` (Natasha facts + GLiNER1 people/org)
+- Использует Natasha как основу (`phones/addresses/amounts`)
+- Потом GLiNER (версия 1, NEREL fine-tune) добавляет:
+  - `people`
+  - `organizations`
+  - `cars`
+  - `messengers`
+- Команда:
+  - `python3 llm/llm_cli.py extract-hybrid --input ... --output ... --call-id ...`
+
+### Как устроена “защита от галлюцинаций” для телефонов
+
+И в LLM-`extract`, и в Natasha используется общий принцип:
+
+1) Формат RU телефона:
+- допускаются только 11 цифр (начинается на `7/8`) или 10 цифр (начинается на `9`)
+- запрет на “слишком нулевую”/сомнительную вариацию (`0{5,}` и т.п.)
+- минимальная уникальность цифр в теле
+
+2) Grounding телефонов:
+- временные метки `[MM:SS]` вычищаются
+- берутся токены с цифрами из транскрипта
+- телефон принимается только если он “объясним” набором цифр в тексте (coverage по токенам >= порога)
+
+Телефоны, которые не проходят — попадают в `notes` как `dropped_phones:...`.
+
+### Что получилось на регрессионном наборе (5 звонков)
+
+Регрессия: `tests/regression/golden/*` (5 фиксированных звонков).
+
+#### LLM `extract` (llama.cpp) — базовая точность по фактам
+
+На этих 5 звонках LLM-`extract` (с Python grounding/sanitize):
+- `85013602`: телефон **89520647701**, commitments “Я передам информацию, с вами свяжутся.”
+- `eda54d05`: адрес **город Тверь, улица Шишкова, дом 104**, commitments “Я буду ждать”
+  - “похожий” телефон LLM иногда придумывал, но grounding отфильтровал его (см. `notes: dropped_phones:...`)
+- `6b9320d3`: сумма **13600 RUB**
+- `a7144842`: commitments “приезжайте” (адреса по версии LLM были слабее/похожими)
+- `ee1e3c47`: слабый адрес “корпус 1”, commitments “будем вас ждать”
+
+#### Natasha `extract-natasha` — “лучше по фактам, чем LLM”
+
+На тех же 5 звонках Natasha стабильно (без галлюцинаций) дала:
+- `85013602`: телефон **89520647701**
+- `eda54d05`: адрес **город Тверь, улица Шишкова, дом 104**
+- `6b9320d3`: сумма **13600 RUB**
+- `a7144842` / `ee1e3c47`: пока пусто (в основном из-за слабости адресных сигналов в ASR и того, что Natasha не пытается угадывать “под адрес”)
+
+При этом Natasha оставляет `commitments` пустыми — это сознательно: commitments остаются под LLM.
+
+### Эксперименты с “слоем сущностей” (NER/IE): что пробовали и почему не взяли в прод
+
+Цель экспериментов была: улучшить извлечение людей/организаций/адресов/денег/обязательств без LLM-галлюцинаций.
+
+#### DeepPavlov `ner_rus_bert` / `ner_rus_convers_distilrubert`
+
+Оказались неадекватными как замена Natasha/LLM на наших разговорных звонках:
+- в основном ловили имена (PER), но адреса/“обязательства” не структурировали
+- остальной доменный шум (ASR/эхо) давал ложные сущности
+
+Поэтому не интегрировали.
+
+#### Pullenti
+
+Pullenti хорошо структурировал некоторые адресные/денежные штуки, но:
+- имена/обязательства на наших ASR-разговорах часто отсутствовали или “склеивались” не так
+- телефоны/номерные кодировки — отдельная боль (ASR диктовки vs true digits)
+
+Остался как эксперимент/возможный будущий “rules+IE” модуль, но не подменяет текущий стек.
+
+#### GLiNER1 (NEREL fine-tune)
+
+GLiNER (версия 1) на `fulstock/gliner-nerel-finetuned` работал заметно лучше как слой:
+- имена людей (PER) — извлекаются
+- организации — извлекаются
+- “салон/отдел” как ORG/PRODUCT — тоже извлекается
+- модель авто/номенклатура — извлекается как `PRODUCT`
+
+Минусы:
+- телефонные диктовки попадают как `NUMBER`, а не как phone
+- обязательства/commitments как структурированная сущность не были выделены стабильно без тонкой настройки
+
+Поэтому GLiNER1 сейчас используется только в гибридном извлечении как “добавка людей/org/машин” (`extract-hybrid`), а commitments остаются под LLM.
+
+#### GLiNER2 (multi-task) — НЕ включили
+
+Мы пробовали GLiNER2 (base `fastino/gliner2-base-v1`) в двух A/B вариантах на наших 5 звонках.
+
+Результат:
+- A/B v1 (`entity_types=['promise','callback','person']` + cue-фильтр): `pred=None` на 4 звонках из 4 с gold обязательствами
+- A/B v2 (русские entity_types + threshold ниже): улучшение только на одном звонке, где нашли **часть** обязательства:
+  - `85013602`: найдено “с вами свяжутся” вместо полного “Я передам информацию, с вами свяжутся.”
+  - остальные звонки: снова `pred=None`
+
+Из-за низкой устойчивости в условиях разговорного ASR “commitments как сущность” из GLiNER2 не получились как надёжная замена LLM.
+
+После эксперимента GLiNER2 пакет и артефакты A/B были удалены (оставлен только GLiNER1/Natasha/LLM стек).
+
+### Где лежат результаты извлечений
+
+- `out/llm_extract/<id>.json` — основной LLM extraction schema (phones/addresses/amounts/commitments)
+- `out/llm_extract_natasha/<id>.json` — Natasha facts (phones/addresses/amounts)
+- `out/llm_roles/<id>.json` — роли (ivr/client/agent)
+- `out/llm_extract_hybrid/<id>.json` — hybrid facts + people/org/car/messengers
