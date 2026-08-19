@@ -158,3 +158,27 @@ class ExtractRolesResponse(BaseModel):
     call_id: str = Field(default="")
     speakers: List[SpeakerRoleItem] = Field(max_length=8, description="one row per speaker id")
     notes: str = Field(default="")
+
+
+class BatchHighlightItem(BaseModel):
+    text: str = Field(default="", description="grouped problem or positive moment")
+    calls: List[str] = Field(default_factory=list, description="call_id list")
+    count: int = Field(default=1, description="number of calls with this pattern")
+
+
+class BatchRiskItem(BaseModel):
+    risk: str = Field(default="")
+    severity: str = Field(default="medium", description="low, medium, or high")
+    evidence: str = Field(default="", description="short justification")
+    calls: List[str] = Field(default_factory=list)
+
+
+class BatchSummaryResponse(BaseModel):
+    date: str = ""
+    n_calls: int = 0
+    executive_summary: str = Field(default="", description="3-5 sentence day overview in Russian")
+    key_moments: List[str] = Field(default_factory=list, max_length=10)
+    recurring_problems: List[BatchHighlightItem] = Field(default_factory=list, max_length=8)
+    positive_moments: List[BatchHighlightItem] = Field(default_factory=list, max_length=6)
+    potential_risks: List[BatchRiskItem] = Field(default_factory=list, max_length=8)
+    top_topics: List[str] = Field(default_factory=list, max_length=8)

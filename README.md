@@ -221,6 +221,46 @@ LLM при этом остаётся для:
 - Команда:
   - `python3 llm/llm_cli.py extract-hybrid --input ... --output ... --call-id ...`
 
+6) `summarize-call` / `summarize-batch` (T-lite через llama.cpp)
+
+Дальше (после `recognize.py`) используем модель **T-lite-it-2.1-q8_0** (llama.cpp runtime) для построения резюме звонков.
+
+#### `summarize-call`
+
+Команда в `llm/llm_cli.py`:
+- `python3 llm/llm_cli.py summarize-call --input out/<id>/transcript.txt --out-dir out/<tag>/<id>/`
+
+Результат:
+- `call_summary.json`
+- `call_summary.md`
+
+Ключевые улучшения, которые мы сделали:
+- `intent` теперь обязан быть **нарративным** (2–3 предложения на русском), а не коротким label.
+- `issues_detected` и `actions` стали “плотнее”: timeline расширяется, а `issues_detected[*].evidence` и `actions[*].who`/`deadline` запрашиваются/валидируются, чтобы в .md не было пустых `: ...`.
+- исправили редкий баг с `call_id`: модель иногда “засоряла” поле лишним текстом, поэтому CLI принудительно доверяет `call_id` из имени директории.
+- улучшили рендер `call_summary.md`, чтобы пустое `evidence`/`who` не выглядело как “`- : ...`”.
+
+#### Защита от пустых транскриптов
+
+Если `transcript.txt` пустой или слишком короткий, `summarize-call` **не вызывает LLM** и сразу пишет пустую структуру:
+- `intent: ""`
+- пустые `topics/timeline/entities/actions/issues_detected`
+- `quality_notes.asr_uncertainty = "empty_transcript_skipped"`
+
+Порог задаётся переменной:
+- `SUMMARIZE_MIN_TEXT_CHARS` (по умолчанию `30`)
+
+#### `summarize-batch`
+
+Команда:
+- `python3 llm/llm_cli.py summarize-batch --input-dir out/<tag>/ --out-dir out/<tag>/ --date YYYY-MM-DD`
+
+Ожидается, что внутри `--input-dir` для каждого звонка лежит папка с `call_summary.json`.
+
+Результат:
+- `batch_summary.json`
+- `batch_summary.md` (единый “дневной” отчёт)
+
 ### Как устроена “защита от галлюцинаций” для телефонов
 
 И в LLM-`extract`, и в Natasha используется общий принцип:

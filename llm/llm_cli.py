@@ -100,6 +100,40 @@ def cmd_call_summarize(args: argparse.Namespace) -> int:
     from llm_backend import summarize_call
 
     refined_text = _read_text(inp)
+    min_chars = int(os.getenv("SUMMARIZE_MIN_TEXT_CHARS", "30"))
+    if len((refined_text or "").strip()) < min_chars:
+        # Avoid hallucinating summaries for empty/near-empty transcripts.
+        # Keep output schema stable: empty lists + narrative fields empty.
+        empty = {
+            "call_id": out_dir.name,
+            "language": "ru",
+            "participants": {
+                "speakers": [],
+                "roles_guess": {"agent": None, "client": None, "manager": None},
+            },
+            "intent": "",
+            "topics": [],
+            "timeline": [],
+            "entities": {
+                "companies": [],
+                "emails": [],
+                "phones": [],
+                "inn": [],
+                "dates": [],
+                "amounts": [],
+                "addresses": [],
+            },
+            "actions": [],
+            "issues_detected": [],
+            "quality_notes": {
+                "has_transfer": False,
+                "transfer_reason": None,
+                "asr_uncertainty": "empty_transcript_skipped",
+            },
+        }
+        _write_json(out_dir / "call_summary.json", empty)
+        (out_dir / "call_summary.md").write_text(_render_call_summary_md(empty), encoding="utf-8")
+        return 0
     # call_id from parent dir name: out/<tag>/<stem>
     call_id = out_dir.name
     summary = summarize_call(call_id=call_id, transcript_text=refined_text)
@@ -174,29 +208,110 @@ def _render_call_summary_md(summary: Dict[str, Any]) -> str:
 
 def _render_batch_summary_md(payload: Dict[str, Any]) -> str:
     lines = []
-    lines.append("# Batch summary")
+    lines.append("# Сводный отчёт за день")
     lines.append("")
-    lines.append(f"Date: {payload.get('date')}")
-    lines.append(f"Calls: {payload.get('n_calls')}")
+    lines.append(f"**Дата:** {payload.get('date')}")
+    lines.append(f"**Звонков:** {payload.get('n_calls')}")
+    backend = payload.get("backend")
+    if backend:
+        lines.append(f"**Backend:** {backend}")
     lines.append("")
-    lines.append("## Overall")
-    lines.append("")
+
+    exec_summary = (payload.get("executive_summary") or "").strip()
+    if exec_summary:
+        lines.append("## Общая картина дня")
+        lines.append("")
+        lines.append(exec_summary)
+        lines.append("")
+
+    key_moments = payload.get("key_moments") or []
+    if key_moments:
+        lines.append("## Ключевые моменты")
+        lines.append("")
+        for item in key_moments:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    recurring = payload.get("recurring_problems") or []
+    if recurring:
+        lines.append("## Повторяющиеся проблемы")
+        lines.append("")
+        for it in recurring:
+            if not isinstance(it, dict):
+                continue
+            text = it.get("text") or ""
+            count = it.get("count") or len(it.get("calls") or [])
+            calls = it.get("calls") or []
+            suffix = f" ({count} звонков"
+            if calls:
+                suffix += f": {', '.join(str(c) for c in calls[:6])}"
+                if len(calls) > 6:
+                    suffix += "…"
+            suffix += ")"
+            lines.append(f"- {text}{suffix}")
+        lines.append("")
+
+    positive = payload.get("positive_moments") or []
+    if positive:
+        lines.append("## Положительные моменты")
+        lines.append("")
+        for it in positive:
+            if not isinstance(it, dict):
+                continue
+            text = it.get("text") or ""
+            calls = it.get("calls") or []
+            if calls:
+                lines.append(f"- {text} (звонки: {', '.join(str(c) for c in calls[:6])})")
+            else:
+                lines.append(f"- {text}")
+        lines.append("")
+
+    risks = payload.get("potential_risks") or []
+    if risks:
+        lines.append("## Потенциальные риски")
+        lines.append("")
+        for it in risks:
+            if not isinstance(it, dict):
+                continue
+            sev = it.get("severity") or "medium"
+            risk = it.get("risk") or ""
+            evidence = (it.get("evidence") or "").strip()
+            calls = it.get("calls") or []
+            line = f"- ({sev}) {risk}"
+            if evidence:
+                line += f": {evidence}"
+            if calls:
+                line += f" [звонки: {', '.join(str(c) for c in calls[:6])}]"
+            lines.append(line)
+        lines.append("")
+
+    topics = payload.get("top_topics") or []
+    if topics:
+        lines.append("## Основные темы")
+        lines.append("")
+        for t in topics:
+            lines.append(f"- {t}")
+        lines.append("")
+
     overall = payload.get("overall") or {}
-    if overall.get("top_intents"):
-        lines.append("### Top intents")
-        for it in overall["top_intents"]:
-            lines.append(f"- {it['intent']}: {it['count']}")
+    if overall.get("top_intents") or overall.get("top_topics") or overall.get("top_issues"):
+        lines.append("## Статистика (rules fallback)")
         lines.append("")
-    if overall.get("top_topics"):
-        lines.append("### Top topics")
-        for it in overall["top_topics"]:
-            lines.append(f"- {it['topic']}: {it['count']}")
-        lines.append("")
-    if overall.get("top_issues"):
-        lines.append("### Top issues")
-        for it in overall["top_issues"]:
-            lines.append(f"- {it['issue']}: {it['count']}")
-        lines.append("")
+        if overall.get("top_intents"):
+            lines.append("### Top intents")
+            for it in overall["top_intents"]:
+                lines.append(f"- {it['intent']}: {it['count']}")
+            lines.append("")
+        if overall.get("top_topics"):
+            lines.append("### Top topics")
+            for it in overall["top_topics"]:
+                lines.append(f"- {it['topic']}: {it['count']}")
+            lines.append("")
+        if overall.get("top_issues"):
+            lines.append("### Top issues")
+            for it in overall["top_issues"]:
+                lines.append(f"- {it['issue']}: {it['count']}")
+            lines.append("")
 
     clusters = payload.get("clusters") or []
     if clusters:

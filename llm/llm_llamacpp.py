@@ -9,6 +9,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from llm_schemas import (
+    BatchSummaryResponse,
     CallSummaryResponse,
     ExtractFactsResponse,
     ExtractRolesResponse,
@@ -902,6 +903,78 @@ def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, 
         # Keep whatever the model produced.
         pass
 
+    return payload
+
+
+def _compact_call_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "call_id": summary.get("call_id") or "",
+        "intent": summary.get("intent") or "",
+        "topics": summary.get("topics") or [],
+        "issues": [
+            {"issue": i.get("issue"), "severity": i.get("severity")}
+            for i in (summary.get("issues_detected") or [])
+            if isinstance(i, dict) and i.get("issue")
+        ],
+        "actions": [
+            {"who": a.get("who"), "action": a.get("action")}
+            for a in (summary.get("actions") or [])[:4]
+            if isinstance(a, dict) and a.get("action")
+        ],
+        "quality_notes": summary.get("quality_notes") or {},
+    }
+
+
+def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    compact = [_compact_call_summary(s) for s in summaries]
+    system = (
+        "You are a Russian call-center analytics lead. Return raw JSON only. "
+        "Synthesize per-call summaries into one daily report. "
+        "Use only facts present in the input summaries. "
+        "Write all narrative fields in Russian."
+    )
+    user = (
+        f"date: {date_hint or 'unknown'}\n"
+        f"n_calls: {len(summaries)}\n\n"
+        "Per-call summaries (JSON array):\n"
+        f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
+        "Return one JSON object with keys: date, n_calls, executive_summary, key_moments, "
+        "recurring_problems, positive_moments, potential_risks, top_topics.\n\n"
+        "Requirements:\n"
+        "- executive_summary: 3-5 sentences — what dominated the day, volume and type of requests.\n"
+        "- key_moments: 5-10 items, each 1-2 sentences with concrete facts from the day.\n"
+        "- recurring_problems: group similar issues across calls; each item: text, calls (call_id list), count.\n"
+        "- positive_moments: where agents explained well, resolved issues, or kept the client; include calls refs.\n"
+        "- potential_risks: churn, billing confusion, blocked services, unresolved tickets; severity low/medium/high.\n"
+        "- top_topics: 4-8 short Russian topic labels.\n"
+        "- Merge near-duplicate problems (e.g. double invoice + overpayment confusion → one item).\n"
+        "- Do not invent calls or facts not in the input."
+    )
+    payload = _chat_json(
+        system=system,
+        user=user,
+        max_tokens=1800,
+        schema=BatchSummaryResponse,
+        schema_name="batch_summary",
+    )
+    payload.pop("_llm_format", None)
+    payload["date"] = date_hint or payload.get("date") or ""
+    payload["n_calls"] = len(summaries)
+    payload.setdefault("executive_summary", "")
+    payload.setdefault("key_moments", [])
+    payload.setdefault("recurring_problems", [])
+    payload.setdefault("positive_moments", [])
+    payload.setdefault("potential_risks", [])
+    payload.setdefault("top_topics", [])
+    payload["backend"] = "llamacpp"
+    payload["per_call"] = [
+        {
+            "call_id": s.get("call_id"),
+            "intent": s.get("intent"),
+            "issues": s.get("issues_detected") or [],
+        }
+        for s in summaries
+    ]
     return payload
 
 

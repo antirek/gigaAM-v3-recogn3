@@ -12,6 +12,7 @@ from llm_llamacpp import (
     extract_facts_llamacpp,
     extract_roles_llamacpp,
     refine_transcript_llamacpp,
+    summarize_batch_llamacpp,
     summarize_call_llamacpp,
 )
 
@@ -102,6 +103,12 @@ def extract_roles(call_id: str, transcript_text: str) -> Dict[str, Any]:
 
 
 def summarize_batch(date_hint: str, summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # batch summarization is cheap to derive deterministically from per-call summaries.
-    # Keep it rules-based until we need model-based clustering.
+    b = _backend()
+    if b in {"llamacpp", "llama.cpp", "llama"}:
+        try:
+            return summarize_batch_llamacpp(date_hint=date_hint, summaries=summaries)
+        except Exception:
+            if not _fallback_to_rules():
+                raise
+            return summarize_batch_rules(date_hint=date_hint, summaries=summaries)
     return summarize_batch_rules(date_hint=date_hint, summaries=summaries)
