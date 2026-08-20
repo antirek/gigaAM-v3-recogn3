@@ -227,39 +227,90 @@ LLM при этом остаётся для:
 
 #### `summarize-call`
 
-Команда в `llm/llm_cli.py`:
-- `python3 llm/llm_cli.py summarize-call --input out/<id>/transcript.txt --out-dir out/<tag>/<id>/`
+Команда в `llm/llm_cli.py` (в контейнере — entrypoint `llm`):
+```bash
+docker-compose run --rm --no-deps llm summarize-call \
+  --input /out/<tag>/<id>/transcript.txt \
+  --out-dir /out/<tag>/<id>
+```
 
 Результат:
 - `call_summary.json`
 - `call_summary.md`
 
-Ключевые улучшения, которые мы сделали:
-- `intent` теперь обязан быть **нарративным** (2–3 предложения на русском), а не коротким label.
-- `issues_detected` и `actions` стали “плотнее”: timeline расширяется, а `issues_detected[*].evidence` и `actions[*].who`/`deadline` запрашиваются/валидируются, чтобы в .md не было пустых `: ...`.
-- исправили редкий баг с `call_id`: модель иногда “засоряла” поле лишним текстом, поэтому CLI принудительно доверяет `call_id` из имени директории.
-- улучшили рендер `call_summary.md`, чтобы пустое `evidence`/`who` не выглядело как “`- : ...`”.
+Ключевые свойства:
+- `intent` — **нарратив на русском (2–3 предложения)**, не короткий label вроде `technical/telephony`.
+- `issues_detected` / `actions` — с цитатами и ролями (`agent`/`client`), где модель их даёт.
+- `call_id` принудительно берётся из имени `--out-dir` (модель иногда засоряла поле).
+- Рендер `.md` не печатает пустые `: ...` для `evidence`/`who`.
 
 #### Защита от пустых транскриптов
 
-Если `transcript.txt` пустой или слишком короткий, `summarize-call` **не вызывает LLM** и сразу пишет пустую структуру:
-- `intent: ""`
-- пустые `topics/timeline/entities/actions/issues_detected`
+Если `transcript.txt` пустой или слишком короткий, `summarize-call` **не вызывает LLM** и пишет пустую структуру с:
 - `quality_notes.asr_uncertainty = "empty_transcript_skipped"`
 
-Порог задаётся переменной:
-- `SUMMARIZE_MIN_TEXT_CHARS` (по умолчанию `30`)
+Порог: `SUMMARIZE_MIN_TEXT_CHARS` (default `30`).
 
-#### `summarize-batch`
+#### `summarize-batch` (дневной отчёт)
 
-Команда:
-- `python3 llm/llm_cli.py summarize-batch --input-dir out/<tag>/ --out-dir out/<tag>/ --date YYYY-MM-DD`
+```bash
+docker-compose run --rm --no-deps \
+  -e LLM_FALLBACK_TO_RULES=0 \
+  -e BATCH_SUMMARY_CHUNK_SIZE=12 \
+  llm summarize-batch \
+  --input-dir /out/<tag> \
+  --out-dir /out/<tag> \
+  --date YYYY-MM-DD
+```
 
-Ожидается, что внутри `--input-dir` для каждого звонка лежит папка с `call_summary.json`.
+Ожидается, что в `--input-dir/*/call_summary.json` уже лежат per-call summary.
 
 Результат:
-- `batch_summary.json`
-- `batch_summary.md` (единый “дневной” отчёт)
+- `batch_summary.json` / `batch_summary.md`
+- поля: `executive_summary`, `key_moments`, `recurring_problems`, `positive_moments`, `potential_risks`, `top_topics`, `recommendations`
+
+**Map-reduce на больших днях:** все summary разом (~десятки тысяч токенов) в контекст T-lite (`-c 16384`) не влезают. Поэтому:
+1. чанки по `BATCH_SUMMARY_CHUNK_SIZE` (default `12`) → дайджесты;
+2. финальная склейка в дневной отчёт (`mode=map_reduce`).
+
+Маленький день (≤ chunk size) идёт одним проходом (`single_pass`).
+
+#### Важные operational notes
+
+1) **`LLM_FALLBACK_TO_RULES=1` (default в compose)**  
+Если llama.cpp недоступен/упал, `summarize-call` молча отдаёт rules-backend: ярлыки `technical/telephony`, `service_request` и шаблонные issues. На большом батче это выглядело как «больше половины плохих summary».  
+Для продакшен-прогонов лучше `-e LLM_FALLBACK_TO_RULES=0`, чтобы сбой был виден.
+
+2) **GPU contention**  
+`llamacpp` держит T-lite в VRAM постоянно. Параллельный `recognize` (diar+ASR) на той же карте может ронять LLM-вызовы → снова rules-fallback. Надёжнее: сначала весь recognize, потом отдельным проходом summarize (или не держать diar/asr одновременно с LLM).
+
+3) **bash + `docker-compose run` в цикле**  
+`docker-compose` читает stdin и может «съесть» список файлов в `while read`. В циклах: `docker-compose run ... </dev/null`.
+
+#### Пример дневного пайплайна (API Mobilon)
+
+Фильтр журнала: `direction=external|outgoing`, `status=ANSWERED`, `duration > 30`, запись по `record_url`.
+
+```text
+data/calls/<tag>/*.mp3
+  → python3 recognize.py --audio … --out out/<tag>/<stem>
+  → llm summarize-call (на каждый transcript)
+  → llm summarize-batch
+```
+
+Прогон **2026-08-19** (исходящие ANSWERED >30с, токен callinfo):
+- **96** звонков, суммарная длительность аудио **12 961 с ≈ 3 ч 36 мин**
+- полный `recognize + summarize`: **~1 ч 13 мин** wall-clock
+- 2 пустых transcript → skip LLM
+- после сбоя fallback пересчитаны 84 summary на T-lite: **~28 мин**
+- дневной `batch_summary` — map-reduce (8 чанков)
+
+Артефакты:
+- `data/calls/outgoing_answered_gt30_2026-08-19/`
+- `out/outgoing_answered_gt30_2026-08-19/<stem>/transcript.txt` + `call_summary.*`
+- `out/outgoing_answered_gt30_2026-08-19/batch_summary.md`
+
+Ограничение качества batch: narrative «о чём день» обычно ок; **агрегатные цифры** (число претензий, «N из M критических») модель может завышать — для ops лучше дополнять детерминированными счётчиками кластеров.
 
 ### Как устроена “защита от галлюцинаций” для телефонов
 
