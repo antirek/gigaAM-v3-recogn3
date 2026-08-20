@@ -212,9 +212,14 @@ def _render_batch_summary_md(payload: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"**Дата:** {payload.get('date')}")
     lines.append(f"**Звонков:** {payload.get('n_calls')}")
+    if payload.get("n_calls_total") and payload.get("n_calls_total") != payload.get("n_calls"):
+        lines.append(f"**Всего в папке (с пустыми):** {payload.get('n_calls_total')}")
     backend = payload.get("backend")
     if backend:
-        lines.append(f"**Backend:** {backend}")
+        mode = payload.get("mode")
+        n_chunks = payload.get("n_chunks")
+        extra = f" ({mode}, chunks={n_chunks})" if mode else ""
+        lines.append(f"**Backend:** {backend}{extra}")
     lines.append("")
 
     exec_summary = (payload.get("executive_summary") or "").strip()
@@ -291,6 +296,14 @@ def _render_batch_summary_md(payload: Dict[str, Any]) -> str:
         lines.append("")
         for t in topics:
             lines.append(f"- {t}")
+        lines.append("")
+
+    recs = payload.get("recommendations") or []
+    if recs:
+        lines.append("## Рекомендации")
+        lines.append("")
+        for r in recs:
+            lines.append(f"- {r}")
         lines.append("")
 
     overall = payload.get("overall") or {}

@@ -176,9 +176,27 @@ class BatchRiskItem(BaseModel):
 class BatchSummaryResponse(BaseModel):
     date: str = ""
     n_calls: int = 0
-    executive_summary: str = Field(default="", description="3-5 sentence day overview in Russian")
-    key_moments: List[str] = Field(default_factory=list, max_length=10)
-    recurring_problems: List[BatchHighlightItem] = Field(default_factory=list, max_length=8)
-    positive_moments: List[BatchHighlightItem] = Field(default_factory=list, max_length=6)
-    potential_risks: List[BatchRiskItem] = Field(default_factory=list, max_length=8)
-    top_topics: List[str] = Field(default_factory=list, max_length=8)
+    executive_summary: str = Field(
+        default="",
+        description="5-8 sentence Russian day overview: volume, dominant themes, outcome mix",
+    )
+    key_moments: List[str] = Field(default_factory=list, max_length=15)
+    recurring_problems: List[BatchHighlightItem] = Field(default_factory=list, max_length=12)
+    positive_moments: List[BatchHighlightItem] = Field(default_factory=list, max_length=10)
+    potential_risks: List[BatchRiskItem] = Field(default_factory=list, max_length=10)
+    top_topics: List[str] = Field(default_factory=list, max_length=12)
+    recommendations: List[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="actionable recommendations for ops/support based on the day",
+    )
+
+
+class BatchChunkDigestResponse(BaseModel):
+    """Intermediate digest for one chunk of calls (map stage)."""
+    chunk_summary: str = Field(default="", description="3-5 short sentences covering this chunk")
+    themes: List[str] = Field(default_factory=list, max_length=8)
+    recurring_problems: List[BatchHighlightItem] = Field(default_factory=list, max_length=5)
+    key_moments: List[str] = Field(default_factory=list, max_length=6)
+    positive_moments: List[BatchHighlightItem] = Field(default_factory=list, max_length=4)
+    potential_risks: List[BatchRiskItem] = Field(default_factory=list, max_length=4)

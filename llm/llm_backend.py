@@ -107,8 +107,11 @@ def summarize_batch(date_hint: str, summaries: List[Dict[str, Any]]) -> Dict[str
     if b in {"llamacpp", "llama.cpp", "llama"}:
         try:
             return summarize_batch_llamacpp(date_hint=date_hint, summaries=summaries)
-        except Exception:
+        except Exception as exc:
             if not _fallback_to_rules():
                 raise
-            return summarize_batch_rules(date_hint=date_hint, summaries=summaries)
+            payload = summarize_batch_rules(date_hint=date_hint, summaries=summaries)
+            payload["backend"] = "rules_fallback"
+            payload["fallback_error"] = f"{type(exc).__name__}: {exc}"
+            return payload
     return summarize_batch_rules(date_hint=date_hint, summaries=summaries)

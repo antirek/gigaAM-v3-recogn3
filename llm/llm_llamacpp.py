@@ -9,6 +9,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from llm_schemas import (
+    BatchChunkDigestResponse,
     BatchSummaryResponse,
     CallSummaryResponse,
     ExtractFactsResponse,
@@ -906,74 +907,244 @@ def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, 
     return payload
 
 
-def _compact_call_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "call_id": summary.get("call_id") or "",
-        "intent": summary.get("intent") or "",
-        "topics": summary.get("topics") or [],
-        "issues": [
-            {"issue": i.get("issue"), "severity": i.get("severity")}
-            for i in (summary.get("issues_detected") or [])
-            if isinstance(i, dict) and i.get("issue")
-        ],
-        "actions": [
-            {"who": a.get("who"), "action": a.get("action")}
-            for a in (summary.get("actions") or [])[:4]
-            if isinstance(a, dict) and a.get("action")
-        ],
-        "quality_notes": summary.get("quality_notes") or {},
+def _compact_call_summary(summary: Dict[str, Any], *, rich: bool = False) -> Dict[str, Any]:
+    """Keep batch prompt small; rich=True for map-stage chunks."""
+    intent = str(summary.get("intent") or "").strip()
+    lim = 320 if rich else 180
+    if len(intent) > lim:
+        intent = intent[: lim - 1].rstrip() + "…"
+    topics = [str(t).strip() for t in (summary.get("topics") or []) if str(t).strip()][: 5 if rich else 3]
+    issues: List[str] = []
+    for i in summary.get("issues_detected") or []:
+        if not isinstance(i, dict):
+            continue
+        issue = str(i.get("issue") or "").strip()
+        if not issue:
+            continue
+        ilim = 160 if rich else 100
+        if len(issue) > ilim:
+            issue = issue[: ilim - 1].rstrip() + "…"
+        issues.append(issue)
+        if len(issues) >= (3 if rich else 2):
+            break
+    out: Dict[str, Any] = {
+        "id": summary.get("call_id") or "",
+        "intent": intent,
+        "topics": topics,
+        "issues": issues,
     }
+    if rich:
+        actions: List[str] = []
+        for a in summary.get("actions") or []:
+            if not isinstance(a, dict):
+                continue
+            act = str(a.get("action") or "").strip()
+            if not act:
+                continue
+            who = str(a.get("who") or "").strip()
+            line = f"{who}: {act}" if who else act
+            if len(line) > 120:
+                line = line[:119].rstrip() + "…"
+            actions.append(line)
+            if len(actions) >= 3:
+                break
+        if actions:
+            out["actions"] = actions
+    return out
 
 
-def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    compact = [_compact_call_summary(s) for s in summaries]
+def _filter_usable_summaries(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    usable = []
+    for s in summaries:
+        q = ((s.get("quality_notes") or {}) if isinstance(s.get("quality_notes"), dict) else {}).get(
+            "asr_uncertainty"
+        )
+        if q == "empty_transcript_skipped":
+            continue
+        if not str(s.get("intent") or "").strip() and not (s.get("issues_detected") or []):
+            continue
+        usable.append(s)
+    return usable
+
+
+def _digest_chunk_llamacpp(
+    *,
+    date_hint: str,
+    chunk_idx: int,
+    n_chunks: int,
+    summaries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    compact = [_compact_call_summary(s, rich=True) for s in summaries]
     system = (
         "You are a Russian call-center analytics lead. Return raw JSON only. "
-        "Synthesize per-call summaries into one daily report. "
-        "Use only facts present in the input summaries. "
-        "Write all narrative fields in Russian."
+        "Analyze this CHUNK of per-call summaries. Be concise. "
+        "Use only facts from the input. Write narrative fields in Russian."
     )
     user = (
         f"date: {date_hint or 'unknown'}\n"
-        f"n_calls: {len(summaries)}\n\n"
-        "Per-call summaries (JSON array):\n"
-        f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
+        f"chunk: {chunk_idx + 1}/{n_chunks}\n"
+        f"calls_in_chunk: {len(summaries)}\n\n"
+        "Per-call summaries (compact JSON; `id` = call_id):\n"
+        f"{json.dumps(compact, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        "Return JSON with: chunk_summary, themes, recurring_problems, key_moments, "
+        "positive_moments, potential_risks.\n"
+        "Requirements (keep SHORT — avoid long quotes):\n"
+        "- chunk_summary: 3-5 sentences.\n"
+        "- recurring_problems: up to 5; text + calls (ids) + count.\n"
+        "- key_moments: up to 6 concrete facts (1 sentence each).\n"
+        "- positive_moments: up to 4.\n"
+        "- potential_risks: up to 4; severity + short evidence.\n"
+        "- themes: up to 8 short labels.\n"
+        "- Do not invent calls. Do not paste long transcript quotes."
+    )
+    # Cap retries: verbose chunk digests must stay within a modest n_predict.
+    prev_cap = os.environ.get("LLAMACPP_MAX_TOKENS")
+    os.environ["LLAMACPP_MAX_TOKENS"] = "1800"
+    try:
+        payload = _chat_json(
+            system=system,
+            user=user,
+            max_tokens=1400,
+            schema=BatchChunkDigestResponse,
+            schema_name="batch_chunk_digest",
+        )
+    finally:
+        if prev_cap is None:
+            os.environ.pop("LLAMACPP_MAX_TOKENS", None)
+        else:
+            os.environ["LLAMACPP_MAX_TOKENS"] = prev_cap
+    payload.pop("_llm_format", None)
+    payload["chunk_idx"] = chunk_idx
+    payload["n_calls"] = len(summaries)
+    payload["call_ids"] = [s.get("call_id") for s in summaries]
+    return payload
+
+
+def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    usable = _filter_usable_summaries(summaries)
+    chunk_size = int(os.getenv("BATCH_SUMMARY_CHUNK_SIZE", "12"))
+    chunk_size = max(8, min(chunk_size, 20))
+
+    digests: List[Dict[str, Any]] = []
+    if len(usable) <= chunk_size:
+        chunks = [usable]
+    else:
+        chunks = [usable[i : i + chunk_size] for i in range(0, len(usable), chunk_size)]
+
+    for i, chunk in enumerate(chunks):
+        digests.append(
+            _digest_chunk_llamacpp(
+                date_hint=date_hint,
+                chunk_idx=i,
+                n_chunks=len(chunks),
+                summaries=chunk,
+            )
+        )
+
+    # Reduce: synthesize final day report from digests (or from the single digest).
+    slim_digests: List[Dict[str, Any]] = []
+    for d in digests:
+        slim_digests.append(
+            {
+                "chunk": d.get("chunk_idx"),
+                "n_calls": d.get("n_calls"),
+                "chunk_summary": d.get("chunk_summary") or "",
+                "themes": d.get("themes") or [],
+                "key_moments": d.get("key_moments") or [],
+                "recurring_problems": [
+                    {
+                        "text": x.get("text"),
+                        "count": x.get("count") or len(x.get("calls") or []),
+                        "calls": (x.get("calls") or [])[:4],
+                    }
+                    for x in (d.get("recurring_problems") or [])
+                    if isinstance(x, dict)
+                ],
+                "positive_moments": [
+                    {
+                        "text": x.get("text"),
+                        "calls": (x.get("calls") or [])[:3],
+                    }
+                    for x in (d.get("positive_moments") or [])
+                    if isinstance(x, dict)
+                ],
+                "potential_risks": [
+                    {
+                        "risk": x.get("risk"),
+                        "severity": x.get("severity"),
+                        "evidence": (x.get("evidence") or "")[:160],
+                        "calls": (x.get("calls") or [])[:3],
+                    }
+                    for x in (d.get("potential_risks") or [])
+                    if isinstance(x, dict)
+                ],
+            }
+        )
+
+    system = (
+        "You are a Russian call-center analytics lead writing a daily ops report. "
+        "Return raw JSON only. Merge chunk digests into one rich day report. "
+        "Use only facts from the digests. Write all narrative fields in Russian. "
+        "Be specific: prefer concrete patterns and examples over generic labels."
+    )
+    user = (
+        f"date: {date_hint or 'unknown'}\n"
+        f"n_calls: {len(usable)} (empty transcripts excluded; total input={len(summaries)})\n"
+        f"n_chunks: {len(digests)}\n\n"
+        "Chunk digests (JSON):\n"
+        f"{json.dumps(slim_digests, ensure_ascii=False, separators=(',', ':'))}\n\n"
         "Return one JSON object with keys: date, n_calls, executive_summary, key_moments, "
-        "recurring_problems, positive_moments, potential_risks, top_topics.\n\n"
+        "recurring_problems, positive_moments, potential_risks, top_topics, recommendations.\n\n"
         "Requirements:\n"
-        "- executive_summary: 3-5 sentences — what dominated the day, volume and type of requests.\n"
-        "- key_moments: 5-10 items, each 1-2 sentences with concrete facts from the day.\n"
-        "- recurring_problems: group similar issues across calls; each item: text, calls (call_id list), count.\n"
-        "- positive_moments: where agents explained well, resolved issues, or kept the client; include calls refs.\n"
-        "- potential_risks: churn, billing confusion, blocked services, unresolved tickets; severity low/medium/high.\n"
-        "- top_topics: 4-8 short Russian topic labels.\n"
-        "- Merge near-duplicate problems (e.g. double invoice + overpayment confusion → one item).\n"
-        "- Do not invent calls or facts not in the input."
+        "- executive_summary: 5-8 sentences — volume, dominant themes, what was resolved vs open, "
+        "notable escalations.\n"
+        "- key_moments: 10-15 concrete items across the whole day (merge near-duplicates).\n"
+        "- recurring_problems: merge across chunks; keep highest counts; include representative call ids "
+        "(up to 6) and accurate count.\n"
+        "- positive_moments: 5-10 real wins / good handling.\n"
+        "- potential_risks: 5-10 items, severity low/medium/high, short evidence, call ids.\n"
+        "- top_topics: 6-12 short Russian labels ordered by importance.\n"
+        "- recommendations: 4-8 actionable bullets for support/ops (process, product, training).\n"
+        "- Do not invent calls or facts."
     )
-    payload = _chat_json(
-        system=system,
-        user=user,
-        max_tokens=1800,
-        schema=BatchSummaryResponse,
-        schema_name="batch_summary",
-    )
+    # Final report is long; allow higher n_predict (compose default cap is often 2048).
+    prev_cap = os.environ.get("LLAMACPP_MAX_TOKENS")
+    os.environ["LLAMACPP_MAX_TOKENS"] = "3500"
+    try:
+        payload = _chat_json(
+            system=system,
+            user=user,
+            max_tokens=2800,
+            schema=BatchSummaryResponse,
+            schema_name="batch_summary",
+        )
+    finally:
+        if prev_cap is None:
+            os.environ.pop("LLAMACPP_MAX_TOKENS", None)
+        else:
+            os.environ["LLAMACPP_MAX_TOKENS"] = prev_cap
     payload.pop("_llm_format", None)
     payload["date"] = date_hint or payload.get("date") or ""
-    payload["n_calls"] = len(summaries)
+    payload["n_calls"] = len(usable)
+    payload["n_calls_total"] = len(summaries)
     payload.setdefault("executive_summary", "")
     payload.setdefault("key_moments", [])
     payload.setdefault("recurring_problems", [])
     payload.setdefault("positive_moments", [])
     payload.setdefault("potential_risks", [])
     payload.setdefault("top_topics", [])
+    payload.setdefault("recommendations", [])
     payload["backend"] = "llamacpp"
+    payload["mode"] = "map_reduce" if len(chunks) > 1 else "single_pass"
+    payload["n_chunks"] = len(chunks)
+    payload["chunk_digests"] = digests
     payload["per_call"] = [
         {
             "call_id": s.get("call_id"),
             "intent": s.get("intent"),
             "issues": s.get("issues_detected") or [],
         }
-        for s in summaries
+        for s in usable
     ]
     return payload
 
