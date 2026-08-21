@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from llm_rules import refine_transcript_rules, summarize_call_rules, summarize_batch_rules
 from llm_ollama import (
@@ -9,6 +9,7 @@ from llm_ollama import (
     summarize_call_ollama,
 )
 from llm_llamacpp import (
+    decide_escalation_llamacpp,
     extract_facts_llamacpp,
     extract_roles_llamacpp,
     refine_transcript_llamacpp,
@@ -62,6 +63,33 @@ def summarize_call(call_id: str, transcript_text: str) -> Dict[str, Any]:
                 raise
             return summarize_call_rules(call_id=call_id, transcript_text=transcript_text)
     return summarize_call_rules(call_id=call_id, transcript_text=transcript_text)
+
+
+def decide_escalation(
+    *,
+    transcript_text: str,
+    intent: str = "",
+    issues: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Supervisor escalation only (does not re-summarize the call)."""
+    b = _backend()
+    if b in {"llamacpp", "llama.cpp", "llama"}:
+        try:
+            return decide_escalation_llamacpp(
+                transcript_text=transcript_text,
+                intent=intent or "",
+                issues=issues or [],
+            )
+        except Exception:
+            if not _fallback_to_rules():
+                raise
+    return {
+        "needed": False,
+        "severity": "low",
+        "reasons": [],
+        "evidence": [],
+        "summary_for_manager": "",
+    }
 
 
 def extract_facts(call_id: str, transcript_text: str) -> Dict[str, Any]:

@@ -97,8 +97,6 @@ def cmd_call_summarize(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    from llm_backend import summarize_call
-
     refined_text = _read_text(inp)
     min_chars = int(os.getenv("SUMMARIZE_MIN_TEXT_CHARS", "30"))
     if len((refined_text or "").strip()) < min_chars:
@@ -130,12 +128,42 @@ def cmd_call_summarize(args: argparse.Namespace) -> int:
                 "transfer_reason": None,
                 "asr_uncertainty": "empty_transcript_skipped",
             },
+            "escalation": {
+                "needed": False,
+                "severity": "low",
+                "reasons": [],
+                "evidence": [],
+                "summary_for_manager": "",
+            },
         }
         _write_json(out_dir / "call_summary.json", empty)
         (out_dir / "call_summary.md").write_text(_render_call_summary_md(empty), encoding="utf-8")
         return 0
-    # call_id from parent dir name: out/<tag>/<stem>
+
     call_id = out_dir.name
+    if getattr(args, "escalation_only", False):
+        from llm_backend import decide_escalation
+
+        summary_path = out_dir / "call_summary.json"
+        if summary_path.is_file():
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                summary = {"call_id": call_id}
+        else:
+            summary = {"call_id": call_id}
+        summary["call_id"] = call_id
+        summary["escalation"] = decide_escalation(
+            transcript_text=refined_text,
+            intent=str(summary.get("intent") or ""),
+            issues=summary.get("issues_detected") or [],
+        )
+        _write_json(summary_path, summary)
+        (out_dir / "call_summary.md").write_text(_render_call_summary_md(summary), encoding="utf-8")
+        return 0
+
+    from llm_backend import summarize_call
+
     summary = summarize_call(call_id=call_id, transcript_text=refined_text)
 
     _write_json(out_dir / "call_summary.json", summary)
@@ -155,7 +183,7 @@ def cmd_batch_summarize(args: argparse.Namespace) -> int:
     # Expect per-call `call_summary.json` inside base_dir/*/
     summaries = []
     for d in sorted(base_dir.iterdir()):
-        if not d.is_dir():
+        if not d.is_dir() or d.name.startswith("_"):
             continue
         p = d / "call_summary.json"
         if not p.is_file():
@@ -203,6 +231,23 @@ def _render_call_summary_md(summary: Dict[str, Any]) -> str:
 
         prefix = f"{who}: " if who else ""
         lines.append(f"- {prefix}{action} ({deadline_txt})")
+
+    esc = summary.get("escalation") if isinstance(summary.get("escalation"), dict) else {}
+    lines.append("")
+    lines.append("## Escalation (supervisor)")
+    if esc.get("needed"):
+        sev = esc.get("severity") or "medium"
+        reasons = ", ".join(esc.get("reasons") or []) or "—"
+        lines.append(f"- **needed:** yes ({sev})")
+        lines.append(f"- **reasons:** {reasons}")
+        mgr = (esc.get("summary_for_manager") or "").strip()
+        if mgr:
+            lines.append(f"- **for manager:** {mgr}")
+        for ev in esc.get("evidence") or []:
+            if str(ev).strip():
+                lines.append(f"  - evidence: {ev}")
+    else:
+        lines.append("- **needed:** no")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -227,6 +272,37 @@ def _render_batch_summary_md(payload: Dict[str, Any]) -> str:
         lines.append("## Общая картина дня")
         lines.append("")
         lines.append(exec_summary)
+        lines.append("")
+
+    escalations = payload.get("supervisor_escalations") or []
+    n_esc = payload.get("n_escalations")
+    if n_esc is None:
+        n_esc = len(escalations)
+    lines.append("## Эскалации руководителю")
+    lines.append("")
+    lines.append(f"**Нужен разбор:** {n_esc} из {payload.get('n_calls') or '—'}")
+    lines.append("")
+    if escalations:
+        sev_rank = {"high": 0, "medium": 1, "low": 2}
+        ordered = sorted(
+            [e for e in escalations if isinstance(e, dict)],
+            key=lambda e: (sev_rank.get(str(e.get("severity") or "").lower(), 9), str(e.get("call_id") or "")),
+        )
+        for e in ordered:
+            cid = e.get("call_id") or "—"
+            sev = e.get("severity") or "medium"
+            reasons = ", ".join(e.get("reasons") or []) or "—"
+            mgr = (e.get("summary_for_manager") or "").strip()
+            lines.append(f"### `{cid}` — {sev}")
+            lines.append(f"- **reasons:** {reasons}")
+            if mgr:
+                lines.append(f"- **для руководителя:** {mgr}")
+            for ev in e.get("evidence") or []:
+                if str(ev).strip():
+                    lines.append(f"  - evidence: {ev}")
+            lines.append("")
+    else:
+        lines.append("За день жёстких эскалаций не зафиксировано.")
         lines.append("")
 
     key_moments = payload.get("key_moments") or []
@@ -375,6 +451,11 @@ def main() -> int:
     p_call = sub.add_parser("summarize-call", help="Summarize one call")
     p_call.add_argument("--input", required=True, type=str, help="refined transcript file")
     p_call.add_argument("--out-dir", required=True, type=str)
+    p_call.add_argument(
+        "--escalation-only",
+        action="store_true",
+        help="Only (re)compute supervisor escalation; keep existing call_summary fields",
+    )
     p_call.set_defaults(fn=cmd_call_summarize)
 
     p_batch = sub.add_parser("summarize-batch", help="Summarize a batch folder")

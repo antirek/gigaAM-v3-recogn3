@@ -196,6 +196,13 @@ def summarize_call_rules(*, call_id: str, transcript_text: str) -> Dict[str, Any
             "transfer_reason": None,
             "asr_uncertainty": None,
         },
+        "escalation": {
+            "needed": False,
+            "severity": "low",
+            "reasons": [],
+            "evidence": [],
+            "summary_for_manager": "",
+        },
     }
     return summary
 
@@ -239,11 +246,28 @@ def summarize_batch_rules(*, date_hint: str, summaries: List[Dict[str, Any]]) ->
             }
         )
 
+    escalations = []
+    for s in summaries:
+        esc = s.get("escalation") if isinstance(s.get("escalation"), dict) else {}
+        if not esc.get("needed"):
+            continue
+        escalations.append(
+            {
+                "call_id": s.get("call_id") or "",
+                "severity": esc.get("severity") or "medium",
+                "reasons": list(esc.get("reasons") or [])[:5],
+                "summary_for_manager": str(esc.get("summary_for_manager") or "").strip()[:400],
+                "evidence": [str(e).strip()[:180] for e in (esc.get("evidence") or []) if str(e).strip()][:3],
+            }
+        )
+
     payload = {
         "date": date_hint or "",
         "n_calls": n_calls,
         "overall": overall,
         "clusters": clusters,
+        "supervisor_escalations": escalations,
+        "n_escalations": len(escalations),
         "per_call": [{"call_id": s.get("call_id"), "intent": s.get("intent"), "issues": s.get("issues_detected") or []} for s in summaries],
     }
     return payload

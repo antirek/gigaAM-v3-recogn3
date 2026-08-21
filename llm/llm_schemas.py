@@ -93,6 +93,36 @@ class QualityNotes(BaseModel):
     asr_uncertainty: Optional[str] = None
 
 
+class EscalationDecision(BaseModel):
+    """Whether the call should be reviewed by the agent's supervisor (QoS / complaint)."""
+
+    needed: bool = Field(
+        default=False,
+        description="true only if at least one hard escalation criterion matched",
+    )
+    severity: str = Field(
+        default="low",
+        description="high, medium, or low — only meaningful when needed=true",
+    )
+    reasons: List[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description=(
+            "subset of: complaint_threat, billing_dispute, agent_quality, "
+            "unresolved_repeat, process_failure"
+        ),
+    )
+    evidence: List[str] = Field(
+        default_factory=list,
+        max_length=4,
+        description="short exact quotes from the transcript supporting the decision",
+    )
+    summary_for_manager: str = Field(
+        default="",
+        description="1-2 sentences in Russian for the supervisor, empty if needed=false",
+    )
+
+
 class CallSummaryResponse(BaseModel):
     call_id: str = ""
     language: str = "ru"
@@ -104,6 +134,7 @@ class CallSummaryResponse(BaseModel):
     actions: List[ActionItem] = Field(default_factory=list)
     issues_detected: List[IssueItem] = Field(default_factory=list)
     quality_notes: QualityNotes = Field(default_factory=QualityNotes)
+    escalation: EscalationDecision = Field(default_factory=EscalationDecision)
 
 
 class PhoneItem(BaseModel):

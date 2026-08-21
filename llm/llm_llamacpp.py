@@ -12,6 +12,7 @@ from llm_schemas import (
     BatchChunkDigestResponse,
     BatchSummaryResponse,
     CallSummaryResponse,
+    EscalationDecision,
     ExtractFactsResponse,
     ExtractRolesResponse,
     SafeRefineResponse,
@@ -24,7 +25,7 @@ def _llamacpp_url() -> str:
 
 
 def _llamacpp_model() -> str:
-    return os.getenv("LLAMACPP_MODEL", "T-lite-it-2.1-q8_0").strip()
+    return os.getenv("LLAMACPP_MODEL", "GigaChat3.1-10B-A1.8B-q6_k").strip()
 
 
 def _extract_json(s: str) -> Dict[str, Any]:
@@ -811,6 +812,283 @@ def _refine_transcript_llamacpp_smart(transcript_text: str) -> Tuple[str, List[d
     return refined, edits, safety
 
 
+_ESCALATION_REASONS = {
+    "complaint_threat",
+    "billing_dispute",
+    "agent_quality",
+    "unresolved_repeat",
+    "process_failure",
+}
+
+_IVR_HOLD_RE = re.compile(
+    r"операторы\s+заняты|все\s+наши\s+операторы|оставайтесь\s+на\s+линии|"
+    r"продолжаем\s+дозваниваться|оставьте\s+сообщение|номер\s+не\s+отвечает|"
+    r"благодарим\s+за\s+терпение|ваш\s+звонок\s+очень\s+важен|"
+    r"в\s+настоящее\s+время\s+все\s+операторы",
+    re.IGNORECASE,
+)
+
+_SUPPORT_DIALOGUE_RE = re.compile(
+    r"заявк|интеграц|битрикс|whatsapp|телеграм|сч[её]т|пересч[её]т|лиценз|"
+    r"настрой|мессенджер|претенз|долг|оплат|тариф|конфигуратор",
+    re.IGNORECASE,
+)
+
+_PROCESS_FAILURE_TIME_RE = re.compile(
+    r"столько\s+времени|около\s+двух\s+недел|две\s+недел|2\s+недел",
+    re.IGNORECASE,
+)
+_PROCESS_FAILURE_CUE_RE = re.compile(
+    r"стар(ая|ой|ую|ое)\b|не\s+был[ао]?\s+отключ|не\s+отключили|осталось\s+забыт",
+    re.IGNORECASE,
+)
+
+
+def _empty_escalation() -> Dict[str, Any]:
+    return {
+        "needed": False,
+        "severity": "low",
+        "reasons": [],
+        "evidence": [],
+        "summary_for_manager": "",
+    }
+
+
+def _transcript_content_lines(transcript_text: str) -> List[str]:
+    lines: List[str] = []
+    for raw in (transcript_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^\[[^\]]+\]\s*Спикер\s*\d+\s*:\s*(.*)$", line, flags=re.IGNORECASE)
+        text = (m.group(1) if m else line).strip()
+        if text:
+            lines.append(text)
+    return lines
+
+
+def _is_ivr_or_hold_only(transcript_text: str) -> bool:
+    """True for queue/IVR/no-answer stubs — not a live agent QoS review."""
+    tx = transcript_text or ""
+    if not _IVR_HOLD_RE.search(tx):
+        return False
+    if _SUPPORT_DIALOGUE_RE.search(tx):
+        # Real support topic present → not hold-only, even if IVR phrase appears.
+        return False
+    lines = _transcript_content_lines(tx)
+    if len(lines) <= 8:
+        return True
+    ivrish = 0
+    for t in lines:
+        if _IVR_HOLD_RE.search(t) or (
+            len(t) < 45 and re.search(r"^(здравствуйте|добрый|алло|угу|ага|да|нет)\b", t, re.I)
+        ):
+            ivrish += 1
+    return ivrish >= max(3, int(0.55 * len(lines)))
+
+
+def _has_hard_process_failure_cues(transcript_text: str) -> bool:
+    tx = transcript_text or ""
+    return bool(_PROCESS_FAILURE_TIME_RE.search(tx) and _PROCESS_FAILURE_CUE_RE.search(tx))
+
+
+def _sanitize_escalation(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    needed = bool(raw.get("needed"))
+    severity = str(raw.get("severity") or "low").strip().lower()
+    if severity not in {"low", "medium", "high"}:
+        severity = "medium" if needed else "low"
+    reasons: List[str] = []
+    for r in raw.get("reasons") or []:
+        code = str(r or "").strip().lower()
+        if code in _ESCALATION_REASONS and code not in reasons:
+            reasons.append(code)
+    evidence: List[str] = []
+    for e in raw.get("evidence") or []:
+        q = str(e or "").strip()
+        if q and q not in evidence:
+            evidence.append(q[:180])
+        if len(evidence) >= 4:
+            break
+    summary = str(raw.get("summary_for_manager") or "").strip()
+    if not needed:
+        return _empty_escalation()
+    if not reasons:
+        # Hard gate: no whitelisted reason → do not escalate.
+        return _empty_escalation()
+    if not summary:
+        summary = "Требуется разбор руководителем: " + ", ".join(reasons)
+    return {
+        "needed": True,
+        "severity": severity if severity != "low" else "medium",
+        "reasons": reasons[:5],
+        "evidence": evidence,
+        "summary_for_manager": summary[:400],
+    }
+
+
+def _demote_queue_false_positives(transcript_text: str, decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop process_failure/agent_quality that only reflect IVR wait / no-answer."""
+    if not decision.get("needed"):
+        return decision
+    tx = transcript_text or ""
+    if not _IVR_HOLD_RE.search(tx):
+        return decision
+    if _has_hard_process_failure_cues(tx) or _SUPPORT_DIALOGUE_RE.search(tx):
+        return decision
+    reasons = [r for r in (decision.get("reasons") or []) if r not in {"process_failure", "agent_quality"}]
+    if not reasons:
+        return _empty_escalation()
+    out = dict(decision)
+    out["reasons"] = reasons
+    return _sanitize_escalation(out)
+
+
+def _quote_around(text: str, match: "re.Match", *, radius: int = 70) -> str:
+    start = max(0, match.start() - radius)
+    end = min(len(text), match.end() + radius)
+    q = text[start:end].strip().replace("\n", " ")
+    if start > 0:
+        q = "…" + q
+    if end < len(text):
+        q = q + "…"
+    return q[:180]
+
+
+def _escalation_keyword_boost(transcript_text: str, decision: Dict[str, Any]) -> Dict[str, Any]:
+    """High-precision RU cues the LLM sometimes under-fires on."""
+    tx = transcript_text or ""
+    reasons = list(decision.get("reasons") or []) if decision.get("needed") else []
+    evidence = list(decision.get("evidence") or []) if decision.get("needed") else []
+    summary = str(decision.get("summary_for_manager") or "").strip()
+    severity = str(decision.get("severity") or "medium")
+    changed = False
+
+    # process_failure: independent cues (can be far apart in the transcript)
+    time_waste = _PROCESS_FAILURE_TIME_RE.search(tx)
+    process_cue = _PROCESS_FAILURE_CUE_RE.search(tx)
+    if time_waste and process_cue:
+        if "process_failure" not in reasons:
+            reasons.append("process_failure")
+            changed = True
+        for m in (time_waste, process_cue):
+            q = _quote_around(tx, m)
+            if q and q not in evidence:
+                evidence.append(q)
+                changed = True
+        if not summary:
+            summary = "Процессный сбой компании уже стоил клиенту заметного времени."
+            changed = True
+
+    boosts: List[Tuple[str, "re.Pattern", str]] = [
+        (
+            "complaint_threat",
+            re.compile(r"претензи", re.IGNORECASE),
+            "Клиент угрожает претензией — нужен разбор руководителем.",
+        ),
+        (
+            "billing_dispute",
+            re.compile(
+                r"не\s+надо\s+оплачивать|не\s+за\s+что\s+плат|отказ.*оплач|отказались.*оплач",
+                re.IGNORECASE,
+            ),
+            "Клиент отказывается оплачивать спорные услуги — нужен разбор биллинга/QoS.",
+        ),
+    ]
+    for code, pat, default_summary in boosts:
+        m = pat.search(tx)
+        if not m:
+            continue
+        if code not in reasons:
+            reasons.append(code)
+            changed = True
+        q = _quote_around(tx, m)
+        if q and q not in evidence:
+            evidence.append(q)
+            changed = True
+        if not summary:
+            summary = default_summary
+            changed = True
+    if not reasons:
+        return decision if decision.get("needed") else _empty_escalation()
+    if not changed and decision.get("needed"):
+        return decision
+    return _sanitize_escalation(
+        {
+            "needed": True,
+            "severity": "high" if "complaint_threat" in reasons else (severity if severity != "low" else "medium"),
+            "reasons": reasons,
+            "evidence": evidence[:4],
+            "summary_for_manager": summary,
+        }
+    )
+
+
+def decide_escalation_llamacpp(*, transcript_text: str, intent: str, issues: List[Any]) -> Dict[str, Any]:
+    """Dedicated pass: supervisor escalation is too easy to miss inside the big summary schema."""
+    if _is_ivr_or_hold_only(transcript_text):
+        return _empty_escalation()
+
+    issues_short: List[str] = []
+    for i in issues or []:
+        if isinstance(i, dict):
+            t = str(i.get("issue") or "").strip()
+            if t:
+                issues_short.append(t[:160])
+        if len(issues_short) >= 4:
+            break
+    # Keep transcript bounded for speed; criteria need quotes from the call itself.
+    tx = transcript_text.strip()
+    if len(tx) > 9000:
+        tx = tx[:9000] + "\n…[truncated]"
+    system = (
+        "You are a QA lead for a Russian telephony support team. Return raw JSON only. "
+        "Decide whether the AGENT'S SUPERVISOR must review this call (service quality / complaint). "
+        "This is NOT for routine L2 engineering tickets and NOT for IVR/queue wait. "
+        "Use only transcript facts. Prefer needed=false when unsure."
+    )
+    user = (
+        f"intent_hint: {intent.strip()[:400]}\n"
+        f"issues_hint: {json.dumps(issues_short, ensure_ascii=False)}\n\n"
+        f"Transcript:\n{tx}\n\n"
+        "Return JSON EscalationDecision fields: needed, severity, reasons, evidence, summary_for_manager.\n"
+        "needed=true ONLY if ≥1 hard criterion is clearly present in a LIVE agent↔client dialogue:\n"
+        "1) complaint_threat — formal claim/complaint/legal/management threat.\n"
+        "2) billing_dispute — refuse to pay unwanted/wrong services, overcharge protest, "
+        "demand recalc/refund (e.g. «не надо оплачивать», «не за что платим»). "
+        "Manager callback does not cancel this.\n"
+        "3) agent_quality — after a live agent joined: hung up / ended without answering, "
+        "refused help without handoff, ignored an explicit ask. "
+        "Closing after client says «всё норм» is NOT agent_quality.\n"
+        "4) unresolved_repeat — same problem days/weeks with a live agent, still no clear fix.\n"
+        "5) process_failure — company mistake AFTER support interaction already wasted significant "
+        "client time (e.g. old line not disabled, weeks of cleanup). "
+        "Waiting in queue / IVR / 'operators busy' / no-answer voicemail is NOT process_failure.\n\n"
+        "Hard negatives → needed=false:\n"
+        "- IVR only, hold music prompts, «операторы заняты», «оставайтесь на линии», "
+        "«продолжаем дозваниваться», «оставьте сообщение», number does not answer.\n"
+        "- Call never reaches a human agent.\n"
+        "- Calm mutual invoice review without refuse-to-pay.\n"
+        "- Polite OK ticket close.\n"
+        "- intent_hint saying client waits for operator is NOT enough by itself.\n\n"
+        "If needed=true: severity high|medium, reasons 1..3 exact codes above, evidence 1..3 short quotes "
+        "from the live dialogue, summary_for_manager 1-2 Russian sentences.\n"
+        "If needed=false: reasons=[], evidence=[], summary_for_manager='', severity=low."
+    )
+    payload = _chat_json(
+        system=system,
+        user=user,
+        max_tokens=500,
+        schema=EscalationDecision,
+        schema_name="escalation_decision",
+    )
+    payload.pop("_llm_format", None)
+    decided = _sanitize_escalation(payload)
+    decided = _demote_queue_false_positives(transcript_text, decided)
+    return _escalation_keyword_boost(transcript_text, decided)
+
+
 def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, Any]:
     system = (
         "You are a Russian customer-call analyst. Return raw JSON only. "
@@ -824,7 +1102,7 @@ def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, 
         f"call_id: {call_id}\n\n"
         f"Transcript:\n{transcript_text}\n\n"
         "Return one JSON object with keys: call_id, language, participants, intent, topics, "
-        "timeline, entities, actions, issues_detected, quality_notes.\n\n"
+        "timeline, entities, actions, issues_detected, quality_notes, escalation.\n\n"
         "Output requirements:\n"
         "- intent: 2-3 sentences in Russian (include what requested + next step/expected outcome).\n"
         "- topics: 2..4 items max, short Russian phrases (no long explanations).\n"
@@ -833,12 +1111,13 @@ def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, 
         "- actions: 2..4 items; `who` MUST be either `agent` or `client` (based on participants in the transcript).\n"
         "- If you cannot provide a non-empty `evidence` quote for an issue, then omit that issue item instead of leaving evidence empty.\n"
         "- If you are unsure who does an action, prefer the more likely side from transcript roles_guess.\n"
-        "- entities: only list what is explicitly present in the transcript (empty lists are OK)."
+        "- entities: only list what is explicitly present in the transcript (empty lists are OK).\n"
+        "- escalation: set needed=false with empty reasons/evidence/summary (filled in a later step)."
     )
     payload = _chat_json(
         system=system,
         user=user,
-        max_tokens=1100,
+        max_tokens=1400,
         schema=CallSummaryResponse,
         schema_name="call_summary",
     )
@@ -904,6 +1183,15 @@ def summarize_call_llamacpp(*, call_id: str, transcript_text: str) -> Dict[str, 
         # Keep whatever the model produced.
         pass
 
+    try:
+        payload["escalation"] = decide_escalation_llamacpp(
+            transcript_text=transcript_text,
+            intent=str(payload.get("intent") or ""),
+            issues=payload.get("issues_detected") or [],
+        )
+    except Exception:
+        payload["escalation"] = _sanitize_escalation(payload.get("escalation"))
+
     return payload
 
 
@@ -933,6 +1221,13 @@ def _compact_call_summary(summary: Dict[str, Any], *, rich: bool = False) -> Dic
         "topics": topics,
         "issues": issues,
     }
+    esc = summary.get("escalation") if isinstance(summary.get("escalation"), dict) else {}
+    if esc.get("needed"):
+        out["escalation"] = {
+            "needed": True,
+            "severity": esc.get("severity"),
+            "reasons": esc.get("reasons") or [],
+        }
     if rich:
         actions: List[str] = []
         for a in summary.get("actions") or []:
@@ -1020,8 +1315,29 @@ def _digest_chunk_llamacpp(
     return payload
 
 
+def _collect_supervisor_escalations(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for s in summaries:
+        esc = s.get("escalation") if isinstance(s.get("escalation"), dict) else {}
+        if not esc.get("needed"):
+            continue
+        items.append(
+            {
+                "call_id": s.get("call_id") or "",
+                "severity": esc.get("severity") or "medium",
+                "reasons": list(esc.get("reasons") or [])[:5],
+                "summary_for_manager": str(esc.get("summary_for_manager") or "").strip()[:400],
+                "evidence": [str(e).strip()[:180] for e in (esc.get("evidence") or []) if str(e).strip()][:3],
+            }
+        )
+    sev_rank = {"high": 0, "medium": 1, "low": 2}
+    items.sort(key=lambda x: (sev_rank.get(str(x.get("severity") or "").lower(), 9), str(x.get("call_id") or "")))
+    return items
+
+
 def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
     usable = _filter_usable_summaries(summaries)
+    escalations = _collect_supervisor_escalations(usable)
     chunk_size = int(os.getenv("BATCH_SUMMARY_CHUNK_SIZE", "12"))
     chunk_size = max(8, min(chunk_size, 20))
 
@@ -1081,40 +1397,54 @@ def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]])
             }
         )
 
+    esc_for_prompt = [
+        {
+            "id": e.get("call_id"),
+            "severity": e.get("severity"),
+            "reasons": e.get("reasons"),
+            "summary": (e.get("summary_for_manager") or "")[:220],
+        }
+        for e in escalations[:25]
+    ]
+
     system = (
         "You are a Russian call-center analytics lead writing a daily ops report. "
         "Return raw JSON only. Merge chunk digests into one rich day report. "
-        "Use only facts from the digests. Write all narrative fields in Russian. "
+        "Use only facts from the digests and the supervisor_escalations list. "
+        "Write all narrative fields in Russian. "
         "Be specific: prefer concrete patterns and examples over generic labels."
     )
     user = (
         f"date: {date_hint or 'unknown'}\n"
         f"n_calls: {len(usable)} (empty transcripts excluded; total input={len(summaries)})\n"
-        f"n_chunks: {len(digests)}\n\n"
+        f"n_chunks: {len(digests)}\n"
+        f"n_supervisor_escalations: {len(escalations)}\n\n"
+        "Supervisor escalations (deterministic QA flags; cite in executive_summary):\n"
+        f"{json.dumps(esc_for_prompt, ensure_ascii=False, separators=(',', ':'))}\n\n"
         "Chunk digests (JSON):\n"
         f"{json.dumps(slim_digests, ensure_ascii=False, separators=(',', ':'))}\n\n"
         "Return one JSON object with keys: date, n_calls, executive_summary, key_moments, "
         "recurring_problems, positive_moments, potential_risks, top_topics, recommendations.\n\n"
         "Requirements:\n"
-        "- executive_summary: 5-8 sentences — volume, dominant themes, what was resolved vs open, "
-        "notable escalations.\n"
-        "- key_moments: 10-15 concrete items across the whole day (merge near-duplicates).\n"
-        "- recurring_problems: merge across chunks; keep highest counts; include representative call ids "
-        "(up to 6) and accurate count.\n"
-        "- positive_moments: 5-10 real wins / good handling.\n"
-        "- potential_risks: 5-10 items, severity low/medium/high, short evidence, call ids.\n"
-        "- top_topics: 6-12 short Russian labels ordered by importance.\n"
-        "- recommendations: 4-8 actionable bullets for support/ops (process, product, training).\n"
-        "- Do not invent calls or facts."
+        "- Keep narrative SHORT (GigaChat tends to be verbose — resist that).\n"
+        "- executive_summary: 5-7 short sentences — volume, themes, open vs closed, "
+        f"cite n_supervisor_escalations={len(escalations)} and top reason codes only.\n"
+        "- key_moments: 8-12 items; each ≤1 short sentence; no long quotes.\n"
+        "- recurring_problems: merge across chunks; highest counts; up to 6 call ids; short text.\n"
+        "- positive_moments: 4-8 short wins.\n"
+        "- potential_risks: 5-8 items; severity + ≤1 short evidence sentence + call ids.\n"
+        "- top_topics: 6-10 short labels.\n"
+        "- recommendations: 4-6 actionable bullets.\n"
+        "- Do not invent calls or facts. Do not invent escalations beyond the provided list."
     )
-    # Final report is long; allow higher n_predict (compose default cap is often 2048).
+    # Final report is long; GigaChat is verbose — allow higher n_predict than T-lite.
     prev_cap = os.environ.get("LLAMACPP_MAX_TOKENS")
-    os.environ["LLAMACPP_MAX_TOKENS"] = "3500"
+    os.environ["LLAMACPP_MAX_TOKENS"] = "6000"
     try:
         payload = _chat_json(
             system=system,
             user=user,
-            max_tokens=2800,
+            max_tokens=5000,
             schema=BatchSummaryResponse,
             schema_name="batch_summary",
         )
@@ -1134,6 +1464,8 @@ def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]])
     payload.setdefault("potential_risks", [])
     payload.setdefault("top_topics", [])
     payload.setdefault("recommendations", [])
+    payload["supervisor_escalations"] = escalations
+    payload["n_escalations"] = len(escalations)
     payload["backend"] = "llamacpp"
     payload["mode"] = "map_reduce" if len(chunks) > 1 else "single_pass"
     payload["n_chunks"] = len(chunks)
@@ -1143,6 +1475,7 @@ def summarize_batch_llamacpp(*, date_hint: str, summaries: List[Dict[str, Any]])
             "call_id": s.get("call_id"),
             "intent": s.get("intent"),
             "issues": s.get("issues_detected") or [],
+            "escalation_needed": bool(((s.get("escalation") or {}) if isinstance(s.get("escalation"), dict) else {}).get("needed")),
         }
         for s in usable
     ]

@@ -164,12 +164,12 @@ python3 recognize.py --audio … --out … --no-transfer-split
 
 `docker-compose.yml` на сервисе `llamacpp` стартует:
 
-- GGUF: `data/models/llamacpp/T-lite-it-2.1-Q8_0.gguf`
-- Served name/alias: `T-lite-it-2.1-q8_0`
+- GGUF: `data/models/llamacpp/GigaChat3.1-10B-A1.8B-q6_K.gguf`
+- Served name/alias: `GigaChat3.1-10B-A1.8B-q6_k`
 
 `llm` (клиент) использует:
 - `LLM_BACKEND=llamacpp`
-- `LLAMACPP_MODEL=T-lite-it-2.1-q8_0`
+- `LLAMACPP_MODEL=GigaChat3.1-10B-A1.8B-q6_k`
 
 Почему llama.cpp:
 - vLLM убран: на `refine`/JSON schema он давал нестабильный JSON (пустые/обрывающиеся `splits` и раздувание структуры под `max_tokens`).
@@ -221,17 +221,27 @@ LLM при этом остаётся для:
 - Команда:
   - `python3 llm/llm_cli.py extract-hybrid --input ... --output ... --call-id ...`
 
-6) `summarize-call` / `summarize-batch` (T-lite через llama.cpp)
+6) `summarize-call` / `summarize-batch` (GigaChat3.1 через llama.cpp)
 
-Дальше (после `recognize.py`) используем модель **T-lite-it-2.1-q8_0** (llama.cpp runtime) для построения резюме звонков.
+Дальше (после `recognize.py`) используем **GigaChat3.1-10B-A1.8B** (MoE 10B / 1.8B active, GGUF **q6_K**) через llama.cpp для резюме звонков и эскалаций.
+
+Ранее стоял T-lite-it-2.1-Q8_0; файл `data/models/llamacpp/T-lite-it-2.1-Q8_0.gguf` можно оставить рядом для A/B. GigaChat заметно быстрее на той же RTX 5060 Ti 16 GB (`-c 16384`, full offload).
 
 #### `summarize-call`
 
 Команда в `llm/llm_cli.py` (в контейнере — entrypoint `llm`):
 ```bash
-docker-compose run --rm --no-deps llm summarize-call \
+docker-compose run --rm --no-deps -e LLM_FALLBACK_TO_RULES=0 llm summarize-call \
   --input /out/<tag>/<id>/transcript.txt \
-  --out-dir /out/<tag>/<id>
+  --out-dir /out/<tag>/<id> </dev/null
+```
+
+Только пересчёт эскалации (intent/issues не трогает):
+```bash
+docker-compose run --rm --no-deps -e LLM_FALLBACK_TO_RULES=0 llm summarize-call \
+  --escalation-only \
+  --input /out/<tag>/<id>/transcript.txt \
+  --out-dir /out/<tag>/<id> </dev/null
 ```
 
 Результат:
@@ -243,11 +253,33 @@ docker-compose run --rm --no-deps llm summarize-call \
 - `issues_detected` / `actions` — с цитатами и ролями (`agent`/`client`), где модель их даёт.
 - `call_id` принудительно берётся из имени `--out-dir` (модель иногда засоряла поле).
 - Рендер `.md` не печатает пустые `: ...` для `evidence`/`who`.
+- `escalation` — отдельный LLM-pass после summary (см. ниже); в `.md` секция **Escalation (supervisor)**.
+
+#### Эскалация руководителю (`escalation`)
+
+Поле в `call_summary.json`:
+```json
+"escalation": {
+  "needed": true,
+  "severity": "high|medium|low",
+  "reasons": ["complaint_threat", "billing_dispute", "agent_quality", "unresolved_repeat", "process_failure"],
+  "evidence": ["короткие цитаты"],
+  "summary_for_manager": "1–2 предложения для супервайзера"
+}
+```
+
+Логика (не путать с L2 tech-ticket):
+1. отдельный chat с узкой схемой `EscalationDecision`;
+2. **IVR/hold pre-filter** — очередь («операторы заняты», «оставайтесь на линии», no-answer) → сразу `needed=false` без LLM;
+3. жёсткие negatives в промпте (ожидание в IVR ≠ `process_failure`);
+4. demote queue false-positives после ответа модели;
+5. **keyword boost** для редких under-fire сигналов (`претензи`, `не надо оплачивать`, «две недели» + «старая линия»).
 
 #### Защита от пустых транскриптов
 
 Если `transcript.txt` пустой или слишком короткий, `summarize-call` **не вызывает LLM** и пишет пустую структуру с:
 - `quality_notes.asr_uncertainty = "empty_transcript_skipped"`
+- `escalation.needed = false`
 
 Порог: `SUMMARIZE_MIN_TEXT_CHARS` (default `30`).
 
@@ -256,24 +288,27 @@ docker-compose run --rm --no-deps llm summarize-call \
 ```bash
 docker-compose run --rm --no-deps \
   -e LLM_FALLBACK_TO_RULES=0 \
+  -e LLAMACPP_MAX_TOKENS=6000 \
   -e BATCH_SUMMARY_CHUNK_SIZE=12 \
   llm summarize-batch \
   --input-dir /out/<tag> \
   --out-dir /out/<tag> \
-  --date YYYY-MM-DD
+  --date YYYY-MM-DD </dev/null
 ```
 
-Ожидается, что в `--input-dir/*/call_summary.json` уже лежат per-call summary.
+Ожидается, что в `--input-dir/*/call_summary.json` уже лежат per-call summary (папки `_…` пропускаются).
 
 Результат:
 - `batch_summary.json` / `batch_summary.md`
-- поля: `executive_summary`, `key_moments`, `recurring_problems`, `positive_moments`, `potential_risks`, `top_topics`, `recommendations`
+- narrative: `executive_summary`, `key_moments`, `recurring_problems`, `positive_moments`, `potential_risks`, `top_topics`, `recommendations`
+- **детерминированно** (не от LLM-выдумки): `supervisor_escalations[]`, `n_escalations` — список звонков с `escalation.needed=true`, в `.md` секция **«Эскалации руководителю»** сразу после общей картины
 
-**Map-reduce на больших днях:** все summary разом (~десятки тысяч токенов) в контекст T-lite (`-c 16384`) не влезают. Поэтому:
+**Map-reduce на больших днях:** все summary разом (~десятки тысяч токенов) в контекст LLM (`-c 16384`) не влезают. Поэтому:
 1. чанки по `BATCH_SUMMARY_CHUNK_SIZE` (default `12`) → дайджесты;
 2. финальная склейка в дневной отчёт (`mode=map_reduce`).
 
-Маленький день (≤ chunk size) идёт одним проходом (`single_pass`).
+Маленький день (≤ chunk size) идёт одним проходом (`single_pass`).  
+GigaChat многословнее T-lite: для reduce удобно `-e LLAMACPP_MAX_TOKENS=6000` (иначе JSON может обрезаться).
 
 #### Важные operational notes
 
@@ -282,10 +317,13 @@ docker-compose run --rm --no-deps \
 Для продакшен-прогонов лучше `-e LLM_FALLBACK_TO_RULES=0`, чтобы сбой был виден.
 
 2) **GPU contention**  
-`llamacpp` держит T-lite в VRAM постоянно. Параллельный `recognize` (diar+ASR) на той же карте может ронять LLM-вызовы → снова rules-fallback. Надёжнее: сначала весь recognize, потом отдельным проходом summarize (или не держать diar/asr одновременно с LLM).
+`llamacpp` держит GGUF в VRAM постоянно. Параллельный `recognize` (diar+ASR) на той же карте может ронять LLM-вызовы → снова rules-fallback. Надёжнее: сначала весь recognize, потом отдельным проходом summarize (или не держать diar/asr одновременно с LLM).
 
 3) **bash + `docker-compose run` в цикле**  
 `docker-compose` читает stdin и может «съесть» список файлов в `while read`. В циклах: `docker-compose run ... </dev/null`.
+
+4) **Смена модели**  
+После замены GGUF / alias в `docker-compose.yml` — `docker-compose up -d --force-recreate llamacpp` и при правках кода `llm/` — `docker-compose build llm` (исходники в образ не монтируются).
 
 #### Пример дневного пайплайна (API Mobilon)
 
@@ -294,23 +332,27 @@ docker-compose run --rm --no-deps \
 ```text
 data/calls/<tag>/*.mp3
   → python3 recognize.py --audio … --out out/<tag>/<stem>
-  → llm summarize-call (на каждый transcript)
+  → llm summarize-call (на каждый transcript; внутри + escalation)
   → llm summarize-batch
 ```
 
-Прогон **2026-08-19** (исходящие ANSWERED >30с, токен callinfo):
-- **96** звонков, суммарная длительность аудио **12 961 с ≈ 3 ч 36 мин**
-- полный `recognize + summarize`: **~1 ч 13 мин** wall-clock
+Прогон **2026-08-19** (исходящие ANSWERED >30с):
+- **96** звонков, аудио **12 961 с ≈ 3 ч 36 мин**
+- полный `recognize + summarize` (исторически на T-lite): **~1 ч 13 мин** wall-clock
 - 2 пустых transcript → skip LLM
-- после сбоя fallback пересчитаны 84 summary на T-lite: **~28 мин**
-- дневной `batch_summary` — map-reduce (8 чанков)
+- миграция на **GigaChat3.1-q6_K**: полный пересчёт 96 `summarize-call` **~16.5 мин**; `summarize-batch` map-reduce (8 чанков) **~1–2 мин**
+- после калибровки эскалации (IVR pre-filter + промпт): **`n_escalations ≈ 32`** из 94 usable (без hold/IVR false positives); жёсткие кейсы (претензия, billing refuse, process «старая линия») сохраняются
+- пересчёт только эскалации: `--escalation-only` на 96 **~7 мин**
 
 Артефакты:
 - `data/calls/outgoing_answered_gt30_2026-08-19/`
 - `out/outgoing_answered_gt30_2026-08-19/<stem>/transcript.txt` + `call_summary.*`
 - `out/outgoing_answered_gt30_2026-08-19/batch_summary.md`
 
-Ограничение качества batch: narrative «о чём день» обычно ок; **агрегатные цифры** (число претензий, «N из M критических») модель может завышать — для ops лучше дополнять детерминированными счётчиками кластеров.
+Ограничение качества:
+- narrative «о чём день» обычно ок;
+- **агрегатные цифры в `executive_summary`** LLM может округлять/путаться — для ops смотреть детерминированный блок `supervisor_escalations` / `n_escalations`;
+- `agent_quality` / `unresolved_repeat` всё ещё могут быть шумнее идеальной QoS-очереди (~10–15) — при необходимости ужесточать промпт и перегонять `--escalation-only`.
 
 ### Как устроена “защита от галлюцинаций” для телефонов
 

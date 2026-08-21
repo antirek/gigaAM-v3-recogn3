@@ -49,7 +49,7 @@ services:
       LLM_BACKEND: llamacpp
       LLM_FALLBACK_TO_RULES: "1"
       LLAMACPP_URL: http://llamacpp:8000/v1
-      LLAMACPP_MODEL: T-lite-it-2.1-q8_0
+      LLAMACPP_MODEL: GigaChat3.1-10B-A1.8B-q6_k
       LLAMACPP_MAX_TOKENS: "2048"
       NVIDIA_VISIBLE_DEVICES: all
     volumes:
@@ -62,9 +62,9 @@ services:
     runtime: nvidia
     command:
       - -m
-      - /models/T-lite-it-2.1-Q8_0.gguf
+      - /models/GigaChat3.1-10B-A1.8B-q6_K.gguf
       - --alias
-      - T-lite-it-2.1-q8_0
+      - GigaChat3.1-10B-A1.8B-q6_k
       - --host
       - 0.0.0.0
       - --port
