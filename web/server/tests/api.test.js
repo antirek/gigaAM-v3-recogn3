@@ -35,6 +35,25 @@ test("normalizeCallRecord parses date and escalation", () => {
   assert.deepEqual(sampleCall.escalationReasons, ["process_failure"]);
 });
 
+test("normalizeCallRecord flattens extract facts", () => {
+  const doc = normalizeCallRecord({
+    callId: "2026-08-19_09-08-00_b494c500",
+    batchTag: "test_batch",
+    transcript: "x",
+    summary: { intent: "i", escalation: { needed: false } },
+    extract: {
+      phones: [{ digits: "79001234567" }],
+      addresses: [{ text: "Тверь" }],
+      amounts: [{ value: "1000", currency: "RUB" }],
+      commitments: [{ promise: "перезвоним" }],
+    },
+  });
+  assert.deepEqual(doc.phones, ["79001234567"]);
+  assert.deepEqual(doc.addresses, ["Тверь"]);
+  assert.equal(doc.amounts[0], "1000 RUB");
+  assert.deepEqual(doc.commitments, ["перезвоним"]);
+});
+
 test("API: import, list, filter, get call, batch", async (t) => {
   await mongoose.connect(TEST_URI);
   await Call.deleteMany({});

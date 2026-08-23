@@ -92,7 +92,9 @@ async function openModal(mode, row) {
       ? `Диалог: ${row.callId}`
       : mode === "json"
         ? `JSON summary: ${row.callId}`
-        : `Саммари: ${row.callId}`;
+        : mode === "extract"
+          ? `Факты (extract): ${row.callId}`
+          : `Саммари: ${row.callId}`;
   modal.show = true;
   modal.content = "";
   modal.call = null;
@@ -104,12 +106,63 @@ async function openModal(mode, row) {
       modal.content = full.transcript || "(пустой транскрипт)";
     } else if (mode === "json") {
       modal.content = JSON.stringify(full.summary || {}, null, 2);
+    } else if (mode === "extract") {
+      modal.content = formatExtract(full);
     } else {
       modal.content = buildSummaryText(full);
     }
   } catch (e) {
     modal.content = `Ошибка: ${e.message}`;
   }
+}
+
+function formatExtract(call) {
+  const ex = call.extract || {};
+  if (!ex || (!ex.phones?.length && !ex.addresses?.length && !ex.amounts?.length && !ex.commitments?.length)) {
+    return JSON.stringify(ex || {}, null, 2) || "(extract пуст — прогоните summarize-call / extract)";
+  }
+  const lines = [];
+  if (ex.phones?.length) {
+    lines.push("Phones:");
+    for (const p of ex.phones) {
+      const digits = typeof p === "string" ? p : p.digits;
+      const ev = typeof p === "object" ? p.evidence : "";
+      lines.push(`- ${digits}${ev ? `  (${ev})` : ""}`);
+    }
+  }
+  if (ex.addresses?.length) {
+    lines.push("\nAddresses:");
+    for (const a of ex.addresses) {
+      const text = typeof a === "string" ? a : a.text;
+      lines.push(`- ${text}`);
+    }
+  }
+  if (ex.amounts?.length) {
+    lines.push("\nAmounts:");
+    for (const a of ex.amounts) {
+      if (typeof a === "string") lines.push(`- ${a}`);
+      else lines.push(`- ${a.value || ""} ${a.currency || ""} ${a.what || ""}`.trim());
+    }
+  }
+  if (ex.commitments?.length) {
+    lines.push("\nCommitments:");
+    for (const c of ex.commitments) {
+      if (typeof c === "string") lines.push(`- ${c}`);
+      else lines.push(`- ${c.promise || ""}${c.when ? ` (когда: ${c.when})` : ""}`);
+    }
+  }
+  if (ex.notes) lines.push(`\nNotes: ${ex.notes}`);
+  lines.push("\n---\n" + JSON.stringify(ex, null, 2));
+  return lines.join("\n");
+}
+
+function factsPreview(row) {
+  const bits = [];
+  if (row.phones?.length) bits.push(`☎ ${row.phones.slice(0, 2).join(", ")}`);
+  if (row.addresses?.length) bits.push(`⌂ ${row.addresses[0]}`);
+  if (row.amounts?.length) bits.push(`₽ ${row.amounts[0]}`);
+  if (row.commitments?.length) bits.push(`✓ ${row.commitments[0].slice(0, 40)}`);
+  return bits.length ? bits.join(" · ") : "—";
 }
 
 function buildSummaryText(call) {
@@ -230,6 +283,7 @@ defineExpose({ openCall: (callId) => openModal("summary", { callId }) });
             <th>ID звонка</th>
             <th>Intent</th>
             <th>Темы</th>
+            <th>Факты</th>
             <th>Эскалация</th>
             <th>Действия</th>
           </tr>
@@ -244,6 +298,7 @@ defineExpose({ openCall: (callId) => openModal("summary", { callId }) });
                 <span v-for="t in (row.topics || []).slice(0, 3)" :key="t" class="reason-tag">{{ t }}</span>
               </div>
             </td>
+            <td class="intent-cell muted">{{ factsPreview(row) }}</td>
             <td>
               <span class="badge" :class="escalationBadge(row).cls">
                 {{ escalationBadge(row).text }}
@@ -255,6 +310,7 @@ defineExpose({ openCall: (callId) => openModal("summary", { callId }) });
             <td>
               <div class="actions">
                 <button class="btn" type="button" @click="openModal('transcript', row)">Диалог</button>
+                <button class="btn" type="button" @click="openModal('extract', row)">Факты</button>
                 <button class="btn" type="button" @click="openModal('json', row)">JSON</button>
                 <button class="btn" type="button" @click="openModal('summary', row)">Саммари</button>
               </div>

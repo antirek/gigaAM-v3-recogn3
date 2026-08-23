@@ -65,7 +65,7 @@ router.get("/", async (req, res, next) => {
         .skip((page - 1) * limit)
         .limit(limit)
         .select(
-          "callId batchTag date startedAt intent topics escalationNeeded escalationSeverity escalationReasons",
+          "callId batchTag date startedAt intent topics phones addresses amounts commitments escalationNeeded escalationSeverity escalationReasons",
         )
         .lean(),
       Call.countDocuments(filter),

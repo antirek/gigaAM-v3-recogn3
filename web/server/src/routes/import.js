@@ -23,6 +23,7 @@ router.post("/batch", async (req, res, next) => {
       transcript: c.transcript || "",
       summary: c.summary || {},
       summaryMd: c.summaryMd || "",
+      extract: c.extract || {},
     }));
 
     const nCalls = await upsertCalls(normalized);

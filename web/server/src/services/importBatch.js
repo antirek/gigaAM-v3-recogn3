@@ -15,9 +15,38 @@ export function parseCallMeta(callId) {
   return { date, startedAt: Number.isNaN(startedAt.getTime()) ? null : startedAt };
 }
 
-export function normalizeCallRecord({ callId, batchTag, transcript, summary, summaryMd }) {
+export function normalizeCallRecord({
+  callId,
+  batchTag,
+  transcript,
+  summary,
+  summaryMd,
+  extract,
+}) {
   const { date, startedAt } = parseCallMeta(callId);
   const esc = summary?.escalation || {};
+  const ex = extract && typeof extract === "object" ? extract : {};
+  const phones = Array.isArray(ex.phones)
+    ? ex.phones.map((p) => (typeof p === "string" ? p : p?.digits || "")).filter(Boolean)
+    : [];
+  const addresses = Array.isArray(ex.addresses)
+    ? ex.addresses.map((a) => (typeof a === "string" ? a : a?.text || "")).filter(Boolean)
+    : [];
+  const amounts = Array.isArray(ex.amounts)
+    ? ex.amounts
+        .map((a) => {
+          if (typeof a === "string") return a;
+          const v = a?.value || "";
+          const c = a?.currency || "";
+          return [v, c].filter(Boolean).join(" ").trim();
+        })
+        .filter(Boolean)
+    : [];
+  const commitments = Array.isArray(ex.commitments)
+    ? ex.commitments
+        .map((c) => (typeof c === "string" ? c : c?.promise || ""))
+        .filter(Boolean)
+    : [];
   return {
     callId,
     batchTag,
@@ -26,6 +55,11 @@ export function normalizeCallRecord({ callId, batchTag, transcript, summary, sum
     transcript: transcript || "",
     summary: summary || {},
     summaryMd: summaryMd || "",
+    extract: ex,
+    phones,
+    addresses,
+    amounts,
+    commitments,
     intent: String(summary?.intent || ""),
     topics: Array.isArray(summary?.topics) ? summary.topics : [],
     escalationNeeded: Boolean(esc.needed),
@@ -94,6 +128,10 @@ export function loadBatchFromDir(batchDir) {
       transcript: readTextIfExists(path.join(callDir, "transcript.txt")),
       summary,
       summaryMd: readTextIfExists(path.join(callDir, "call_summary.md")),
+      extract:
+        readJsonIfExists(path.join(callDir, "extract.json")) ||
+        readJsonIfExists(path.join(callDir, "call_extract.json")) ||
+        {},
     });
   }
 

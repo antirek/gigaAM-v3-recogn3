@@ -46,9 +46,9 @@ python3 tests/regression/run.py --update-golden
 
 ## Web UI (просмотр звонков)
 
-После `recognize` + `summarize-call` + `summarize-batch` данные можно загрузить в **MongoDB** и смотреть в браузере:
+После `recognize` + `summarize-call` (внутри **extract** + summary + escalation) + `summarize-batch` данные можно загрузить в **MongoDB** и смотреть в браузере:
 
-- таб **Список звонков** — фильтры, эскалации, модалки (диалог / JSON / саммари);
+- таб **Список звонков** — фильтры, эскалации, модалки (диалог / **факты extract** / JSON / саммари);
 - таб **Саммари за день** — `batch_summary` + список эскалаций.
 
 Стек: Express + Mongoose + Vue 3, в Docker — **Caddy** (статика + прокси `/api`). Подробности: [`web/README.md`](web/README.md).
@@ -197,21 +197,25 @@ CPU возможен только как fallback / ручной `DEVICE=cpu` (�
 | # | Шаг (CLI) | Что делает | Чем выполняем | Выход |
 |---|-----------|------------|---------------|--------|
 | 1 | `refine` | Нормализация транскрипта (пунктуация, пробелы, мелкие ASR-правки) | **Rules** (`llm_rules`); опционально LLM-патчи через **llama.cpp / GigaChat3.1-q6_K** (`safe`/`smart`) + снова rules | `transcript` refined + debug edits |
-| 2 | `extract` | Факты: телефоны, адреса, суммы, commitments | **GigaChat3.1** (llama.cpp, JSON schema) + Python **sanitize/grounding** телефонов | `phones/addresses/amounts/commitments` |
-| 3 | `extract-natasha` | Те же факты без LLM (без commitments) | **Natasha** (детерминированно) + общий phone grounding | `phones/addresses/amounts` |
+| 2 | `extract` | Факты: телефоны, адреса, суммы, commitments | **GigaChat3.1** (llama.cpp, JSON schema) + Python **sanitize/grounding** телефонов | `extract.json` |
+| 3 | `extract-natasha` | Те же факты без LLM (без commitments) | **Natasha** (детерминированно) + общий phone grounding | JSON (опционально) |
 | 4 | `roles` | Роли спикеров `ivr` / `client` / `agent` | **GigaChat3.1** (llama.cpp) + whitelist sanitize | `speakers[]` + roles |
-| 5 | `extract-hybrid` | Факты + люди/орги/машины/мессенджеры | **Natasha** + **GLiNER1** (`fulstock/gliner-nerel-finetuned`); commitments — не здесь | hybrid JSON |
-| 6 | `summarize-call` | Резюме одного звонка + эскалация супервайзеру | **GigaChat3.1**: (a) summary JSON, (b) отдельный escalation-pass; **IVR/hold pre-filter** + keyword boost; fallback `rules` если `LLM_FALLBACK_TO_RULES=1` | `call_summary.json` / `.md` |
-| 6a | `summarize-call --escalation-only` | Только пересчёт `escalation` | тот же escalation-стек, существующий summary не переписывает narrative | обновляет `escalation` в `call_summary.*` |
-| 7 | `summarize-batch` | Дневной отчёт по папке звонков | **GigaChat3.1** map-reduce (чанки → reduce); список **`supervisor_escalations`** собирается **детерминированно** из per-call JSON | `batch_summary.json` / `.md` |
+| 5 | `extract-hybrid` | Факты + люди/орги/машины/мессенджеры | **Natasha** + **GLiNER1** (эксперимент; в Docker `llm` не установлен) | hybrid JSON |
+| 6 | `summarize-call` | **extract** + резюме + эскалация | **GigaChat3.1**: (0) `extract.json`, (a) summary JSON, (b) escalation-pass; **IVR/hold pre-filter** + keyword boost | `extract.json`, `call_summary.json` / `.md` |
+| 6a | `summarize-call --escalation-only` | Только пересчёт `escalation` | тот же escalation-стек | обновляет `escalation` |
+| 6b | `summarize-call --skip-extract` | Summary без шага extract | как раньше только narrative | без `extract.json` |
+| 7 | `summarize-batch` | Дневной отчёт по папке звонков | **GigaChat3.1** map-reduce; **`supervisor_escalations`** детерминированно | `batch_summary.json` / `.md` |
 
 **Рантайм LLM:** сервис `llamacpp` (`ghcr.io/ggml-org/llama.cpp:server-cuda13`) + GGUF `GigaChat3.1-10B-A1.8B-q6_K.gguf`, alias `GigaChat3.1-10B-A1.8B-q6_k`. Клиент: контейнер `llm`, `LLM_BACKEND=llamacpp`.
 
 **Не LLM / не в таблице выше (но рядом по пайплайну):**
 - сам `recognize.py` (Sortformer + GigaAM, transfer-split, hold-detect) — см. [Архитектура](#архитектура).
 
-Типичный дневной путь для аналитики звонков: **recognize → summarize-call → summarize-batch**.  
-Extract/roles/hybrid — по необходимости (факты, роли, NER), не обязательны для batch-отчёта.
+Типичный дневной путь для аналитики звонков:
+
+**recognize → summarize-call** (внутри: **extract** → summary → escalation) **→ summarize-batch** → import в Mongo → Web UI.
+
+Отдельный CLI `extract` остаётся для пересчёта только фактов; `extract-natasha` / `roles` / `extract-hybrid` — по необходимости.
 
 ### Какие модели сейчас используются
 
@@ -298,6 +302,7 @@ docker-compose run --rm --no-deps -e LLM_FALLBACK_TO_RULES=0 llm summarize-call 
 ```
 
 Результат:
+- `extract.json` — телефоны, адреса, суммы, commitments (шаг **extract**)
 - `call_summary.json`
 - `call_summary.md`
 
@@ -385,7 +390,7 @@ docker-compose run --rm --no-deps \
 ```text
 data/calls/<tag>/*.mp3
   → python3 recognize.py --audio … --out out/<tag>/<stem>
-  → llm summarize-call (на каждый transcript; внутри + escalation)
+  → llm summarize-call (на каждый transcript: extract → summary → escalation)
   → llm summarize-batch
 ```
 
