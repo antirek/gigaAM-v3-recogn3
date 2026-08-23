@@ -87,17 +87,20 @@ def cmd_roles(args: argparse.Namespace) -> int:
 
 
 def cmd_call_summarize(args: argparse.Namespace) -> int:
+    from llm_backend import extract_facts, summarize_call
+
     inp = Path(args.input)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     refined_text = _read_text(inp)
+    call_id = out_dir.name
     min_chars = int(os.getenv("SUMMARIZE_MIN_TEXT_CHARS", "30"))
     if len((refined_text or "").strip()) < min_chars:
         # Avoid hallucinating summaries for empty/near-empty transcripts.
         # Keep output schema stable: empty lists + narrative fields empty.
         empty = {
-            "call_id": out_dir.name,
+            "call_id": call_id,
             "language": "ru",
             "participants": {
                 "speakers": [],
@@ -132,9 +135,20 @@ def cmd_call_summarize(args: argparse.Namespace) -> int:
         }
         _write_json(out_dir / "call_summary.json", empty)
         (out_dir / "call_summary.md").write_text(_render_call_summary_md(empty), encoding="utf-8")
+        if not getattr(args, "skip_extract", False):
+            _write_json(
+                out_dir / "extract.json",
+                {
+                    "call_id": call_id,
+                    "phones": [],
+                    "addresses": [],
+                    "amounts": [],
+                    "commitments": [],
+                    "notes": "empty_transcript_skipped",
+                },
+            )
         return 0
 
-    call_id = out_dir.name
     if getattr(args, "escalation_only", False):
         from llm_backend import decide_escalation
 
@@ -156,7 +170,11 @@ def cmd_call_summarize(args: argparse.Namespace) -> int:
         (out_dir / "call_summary.md").write_text(_render_call_summary_md(summary), encoding="utf-8")
         return 0
 
-    from llm_backend import summarize_call
+    # Pipeline step: structured facts (phones/addresses/amounts/commitments)
+    if not getattr(args, "skip_extract", False):
+        extract_payload = extract_facts(call_id=call_id, transcript_text=refined_text)
+        extract_payload["call_id"] = call_id
+        _write_json(out_dir / "extract.json", extract_payload)
 
     summary = summarize_call(call_id=call_id, transcript_text=refined_text)
 
@@ -442,13 +460,18 @@ def main() -> int:
     p_roles.add_argument("--call-id", default="", type=str)
     p_roles.set_defaults(fn=cmd_roles)
 
-    p_call = sub.add_parser("summarize-call", help="Summarize one call")
+    p_call = sub.add_parser("summarize-call", help="Summarize one call (+ extract facts by default)")
     p_call.add_argument("--input", required=True, type=str, help="refined transcript file")
     p_call.add_argument("--out-dir", required=True, type=str)
     p_call.add_argument(
         "--escalation-only",
         action="store_true",
         help="Only (re)compute supervisor escalation; keep existing call_summary fields",
+    )
+    p_call.add_argument(
+        "--skip-extract",
+        action="store_true",
+        help="Do not run extract step / write extract.json",
     )
     p_call.set_defaults(fn=cmd_call_summarize)
 

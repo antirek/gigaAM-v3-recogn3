@@ -158,6 +158,29 @@ python3 recognize.py --audio … --out … --no-transfer-split
 
 - GigaAM: `data/models/gigaam/`
 - HuggingFace / NeMo: `data/models/hf`, `data/models/nemo`
+- LLM GGUF: `data/models/llamacpp/`
+
+## Используемые модели
+
+Все три рабочие модели в проде крутятся на **GPU (CUDA / VRAM)**, не на CPU:  
+`diar` и `asr` — `runtime: nvidia`, у ASR явно `DEVICE=cuda`; LLM — `llama.cpp` с full GPU offload (`-ngl 99`).  
+CPU возможен только как fallback / ручной `DEVICE=cpu` (для телефонии не используем).
+
+Размеры на диске — по файлам в `data/models/` на этой машине.  
+**VRAM** — ориентир для нашего режима (одна модель на GPU, без параллельного diar+ASR+LLM).
+
+| Роль | Модель | Публикация | Диск | Устройство | VRAM (ориентир) | Где лежит |
+|------|--------|------------|------|------------|-----------------|-----------|
+| **ASR** | [GigaAM](https://huggingface.co/ai-sage/GigaAM-v3) `v3_e2e_rnnt` (~220–240M) | **2025-11** (GigaAM-v3 / e2e) | **0.45 GB** (`v3_e2e_rnnt.ckpt` + tokenizer) | **GPU** | **~1–2 GB** (fp16, короткие чанки) | `data/models/gigaam/` |
+| **Diarization** | [nvidia/diar_streaming_sortformer_4spk-v2.1](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1) (117M) | **2025-10-22** (HF `createdAt`) | **0.47 GB** (`.nemo`) | **GPU** | **~0.5–1.5 GB** | `data/models/hf/hub/models--nvidia--…` |
+| **LLM** | [GigaChat3.1-10B-A1.8B](https://huggingface.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF) **q6_K** (MoE 10B / ~1.8B active) | **2026-03-21** (GGUF repo) | **8.78 GB** (`.gguf`) | **GPU** | **~10–12 GB** (full offload, `-c 16384`) | `data/models/llamacpp/GigaChat3.1-10B-A1.8B-q6_K.gguf` |
+
+**Суммарно на диске (основные веса):** ≈ **9.7 GB**.
+
+Заметки:
+- diar и ASR на одной карте **по очереди** (compose запускает контейнеры последовательно); LLM (`llamacpp`) держит GGUF в VRAM постоянно — не гонять recognize параллельно с summarize.
+- опциональный `extract-hybrid` тянет GLiNER (`fulstock/gliner-nerel-finetuned`) отдельно и в основной дневной путь **не входит**.
+- железная цель пайплайна: **RTX 5060 Ti 16 GB**.
 
 ## Пост-обработка текста (LLM/LLM-free извлечение фактов)
 
