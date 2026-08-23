@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """
-Local LLM runner (MVP).
+LLM CLI for refine / extract / roles / summarize-call / summarize-batch.
 
-This repo currently doesn't run Gemma4 weights. For the first iteration we
-implement a deterministic "rules" backend so:
-  - transcript.refined.txt is produced
-  - call_summary.json is produced
-  - batch_summary.json is produced
-
-Later you can swap backend to Ollama/vLLM/Gemma4 by extending llm_backend.py.
+Backends: LLM_BACKEND=llamacpp (GigaChat via llama.cpp) or rules (deterministic fallback).
 """
 
 from __future__ import annotations

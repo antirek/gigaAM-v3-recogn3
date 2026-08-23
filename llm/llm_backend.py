@@ -4,10 +4,6 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from llm_rules import refine_transcript_rules, summarize_call_rules, summarize_batch_rules
-from llm_ollama import (
-    refine_transcript_ollama,
-    summarize_call_ollama,
-)
 from llm_llamacpp import (
     decide_escalation_llamacpp,
     extract_facts_llamacpp,
@@ -23,7 +19,7 @@ def _backend() -> str:
 
 
 def _fallback_to_rules() -> bool:
-    v = os.getenv("LLM_FALLBACK_TO_RULES", os.getenv("OLLAMA_FALLBACK_TO_RULES", "1")).strip().lower()
+    v = os.getenv("LLM_FALLBACK_TO_RULES", "1").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
 
@@ -36,13 +32,6 @@ def refine_transcript(transcript_text: str, *, mode: str) -> Tuple[str, List[dic
             if not _fallback_to_rules():
                 raise
             return refine_transcript_rules(transcript_text, mode=mode)
-    if b == "ollama":
-        try:
-            return refine_transcript_ollama(transcript_text, mode=mode)
-        except Exception:
-            if not _fallback_to_rules():
-                raise
-            return refine_transcript_rules(transcript_text, mode=mode)
     return refine_transcript_rules(transcript_text, mode=mode)
 
 
@@ -51,13 +40,6 @@ def summarize_call(call_id: str, transcript_text: str) -> Dict[str, Any]:
     if b in {"llamacpp", "llama.cpp", "llama"}:
         try:
             return summarize_call_llamacpp(call_id=call_id, transcript_text=transcript_text)
-        except Exception:
-            if not _fallback_to_rules():
-                raise
-            return summarize_call_rules(call_id=call_id, transcript_text=transcript_text)
-    if b == "ollama":
-        try:
-            return summarize_call_ollama(call_id=call_id, transcript_text=transcript_text)
         except Exception:
             if not _fallback_to_rules():
                 raise

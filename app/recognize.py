@@ -13,7 +13,6 @@ from typing import List, Sequence
 
 from .align import join_texts_by_utterance, pack_asr_chunks, prepare_segments
 from .preprocess import cut_segment, enhance_mode_from_env, ensure_wav_16k_mono, format_ts
-from .qwen_dual import run_qwen_dual
 from .hold_detect import detect_hold_intervals
 from .transfer_split import (
     DEFAULT_TRANSFER_CUES,
@@ -363,14 +362,6 @@ def run_pipeline(audio: Path, out_dir: Path) -> Path:
     else:
         print(f"[orch] done → {transcript_txt}", flush=True)
 
-    # Optional secondary ASR: Qwen3-ASR (sister project) → dual_for_llm.md
-    run_qwen_dual(
-        audio=audio,
-        out_dir=out_dir,
-        wav16=wav16,
-        diar_raw=diar_raw,
-        gigaam_transcript_txt=transcript_txt,
-    )
     return transcript_txt
 
 
@@ -386,11 +377,6 @@ def main() -> None:
         help="Output directory under ./out (default: out/<stem>/)",
     )
     parser.add_argument(
-        "--dual-qwen",
-        action="store_true",
-        help="Also run Qwen3-ASR (../qwen3-asr-campplus) and write dual_for_llm.md",
-    )
-    parser.add_argument(
         "--transfer-split",
         action="store_true",
         help="Force transfer re-diarization on (default: on)",
@@ -402,8 +388,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.dual_qwen:
-        os.environ["QWEN_DUAL"] = "1"
     if args.no_transfer_split:
         os.environ["TRANSFER_SPLIT"] = "0"
     elif args.transfer_split:

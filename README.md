@@ -20,10 +20,6 @@ docker-compose build
 
 # Прогон
 python3 recognize.py --audio data/mono3.wav --out out/mono3
-
-# Опционально: второй проход Qwen3-ASR (соседний ../qwen3-asr-campplus)
-# → transcript_qwen.txt + dual_for_llm.md (два диалога рядом для LLM)
-python3 recognize.py --audio data/mono3.wav --out out/mono3 --dual-qwen
 ```
 
 Результат: `out/mono3/transcript.txt`
@@ -34,8 +30,7 @@ python3 recognize.py --audio data/mono3.wav --out out/mono3 --dual-qwen
 ```
 
 Также: `diar.raw.json`, `segments.json`, `transcript.json`.  
-При срабатывании перевода: `transfer_split.json`, `diar.full.json`, `transfer_parts/`.  
-С `--dual-qwen`: `transcript_qwen.txt`, `asr_qwen.json`, `dual_for_llm.md`.
+При срабатывании перевода: `transfer_split.json`, `diar.full.json`, `transfer_parts/`.
 
 ## Регрессионный набор
 
@@ -174,8 +169,7 @@ python3 recognize.py --audio … --out … --no-transfer-split
 **Рантайм LLM:** сервис `llamacpp` (`ghcr.io/ggml-org/llama.cpp:server-cuda13`) + GGUF `GigaChat3.1-10B-A1.8B-q6_K.gguf`, alias `GigaChat3.1-10B-A1.8B-q6_k`. Клиент: контейнер `llm`, `LLM_BACKEND=llamacpp`.
 
 **Не LLM / не в таблице выше (но рядом по пайплайну):**
-- сам `recognize.py` (Sortformer + GigaAM, transfer-split, hold-detect) — см. [Архитектура](#архитектура);
-- опционально `--dual-qwen` → соседний Qwen3-ASR для второго транскрипта (`transcript_qwen.txt`, `dual_for_llm.md`).
+- сам `recognize.py` (Sortformer + GigaAM, transfer-split, hold-detect) — см. [Архитектура](#архитектура).
 
 Типичный дневной путь для аналитики звонков: **recognize → summarize-call → summarize-batch**.  
 Extract/roles/hybrid — по необходимости (факты, роли, NER), не обязательны для batch-отчёта.
@@ -245,9 +239,7 @@ LLM при этом остаётся для:
 
 6) `summarize-call` / `summarize-batch` (GigaChat3.1 через llama.cpp)
 
-Дальше (после `recognize.py`) используем **GigaChat3.1-10B-A1.8B** (MoE 10B / 1.8B active, GGUF **q6_K**) через llama.cpp для резюме звонков и эскалаций.
-
-Ранее стоял T-lite-it-2.1-Q8_0; файл `data/models/llamacpp/T-lite-it-2.1-Q8_0.gguf` можно оставить рядом для A/B. GigaChat заметно быстрее на той же RTX 5060 Ti 16 GB (`-c 16384`, full offload).
+Дальше (после `recognize.py`) используем **GigaChat3.1-10B-A1.8B** (MoE 10B / 1.8B active, GGUF **q6_K**) через llama.cpp для резюме звонков и эскалаций. На RTX 5060 Ti 16 GB (`-c 16384`, full offload) укладывается в VRAM с запасом.
 
 #### `summarize-call`
 
@@ -330,7 +322,7 @@ docker-compose run --rm --no-deps \
 2. финальная склейка в дневной отчёт (`mode=map_reduce`).
 
 Маленький день (≤ chunk size) идёт одним проходом (`single_pass`).  
-GigaChat многословнее T-lite: для reduce удобно `-e LLAMACPP_MAX_TOKENS=6000` (иначе JSON может обрезаться).
+Для reduce удобно `-e LLAMACPP_MAX_TOKENS=6000` (GigaChat многословный — иначе JSON может обрезаться).
 
 #### Важные operational notes
 
@@ -360,7 +352,7 @@ data/calls/<tag>/*.mp3
 
 Прогон **2026-08-19** (исходящие ANSWERED >30с):
 - **96** звонков, аудио **12 961 с ≈ 3 ч 36 мин**
-- полный `recognize + summarize` (исторически на T-lite): **~1 ч 13 мин** wall-clock
+- полный `recognize + summarize`: **~1 ч 13 мин** wall-clock (до миграции на GigaChat)
 - 2 пустых transcript → skip LLM
 - миграция на **GigaChat3.1-q6_K**: полный пересчёт 96 `summarize-call` **~16.5 мин**; `summarize-batch` map-reduce (8 чанков) **~1–2 мин**
 - после калибровки эскалации (IVR pre-filter + промпт): **`n_escalations ≈ 32`** из 94 usable (без hold/IVR false positives); жёсткие кейсы (претензия, billing refuse, process «старая линия») сохраняются
