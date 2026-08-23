@@ -407,6 +407,19 @@ data/calls/<tag>/*.mp3
 - `out/outgoing_answered_gt30_2026-08-19/<stem>/transcript.txt` + `call_summary.*`
 - `out/outgoing_answered_gt30_2026-08-19/batch_summary.md`
 
+Прогон **2026-08-21** (входящие + исходящие/`external`, ANSWERED >30с) на **RTX 5060 Ti 16 GB**:
+- **87** звонков, аудио **10 476 с ≈ 2 ч 55 мин** → usable LLM **82** (5 пустых transcript)
+- **recognize**: **53.2 мин** (mean ~37 с/звонок; RTF ≈ 3.3×); VRAM diar/ASR по очереди ~0.5–2 GB, llamacpp выключен
+- **summarize-call** (summary+escalation): **12 мин**; затем отдельно **extract**: **4.6 мин** (из‑за устаревшего образа `llm`; в норме оба в одном `summarize-call` ≈ 15–17 мин)
+- **summarize-batch**: **~1.1 мин**; **`n_escalations = 17`**
+- **import** → UI: **~5 с**
+- LLM VRAM (GigaChat3.1-q6_K loaded): **~9.8 GB**
+- детальная таблица: `out/io_answered_gt30_2026-08-21/_METRICS.md`
+
+Артефакты:
+- `data/calls/io_answered_gt30_2026-08-21/`
+- `out/io_answered_gt30_2026-08-21/` + `_METRICS.md`
+
 Ограничение качества:
 - narrative «о чём день» обычно ок;
 - **агрегатные цифры в `executive_summary`** LLM может округлять/путаться — для ops смотреть детерминированный блок `supervisor_escalations` / `n_escalations`;
