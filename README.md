@@ -44,6 +44,22 @@ python3 tests/regression/run.py --update-golden
 
 Подробности: [`tests/regression/README.md`](tests/regression/README.md).
 
+## Web UI (просмотр звонков)
+
+После `recognize` + `summarize-call` + `summarize-batch` данные можно загрузить в **MongoDB** и смотреть в браузере:
+
+- таб **Список звонков** — фильтры, эскалации, модалки (диалог / JSON / саммари);
+- таб **Саммари за день** — `batch_summary` + список эскалаций.
+
+Стек: Express + Mongoose + Vue 3, в Docker — **Caddy** (статика + прокси `/api`). Подробности: [`web/README.md`](web/README.md).
+
+```bash
+docker-compose up -d mongo web-api web
+# → http://localhost:8080
+
+docker-compose run --rm web-api node scripts/import-batch.js /out/outgoing_answered_gt30_2026-08-19
+```
+
 ## Архитектура
 
 | Сервис | Образ | Роль |

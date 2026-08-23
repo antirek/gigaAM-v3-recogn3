@@ -85,3 +85,38 @@ services:
     volumes:
       - ./data/models/llamacpp:/models:ro
 
+  mongo:
+    image: mongo:7
+    # host port optional; web-api talks via docker network
+    # ports:
+    #   - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  web-api:
+    build:
+      context: ./web/server
+    image: gigaam-recogn2-web-api:latest
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/gigaam_calls
+      WEB_PORT: "3000"
+      CORS_ORIGIN: ${WEB_CORS_ORIGIN:-http://localhost:8080}
+    depends_on:
+      - mongo
+    volumes:
+      - ./out:/out:ro
+    expose:
+      - "3000"
+
+  web:
+    build:
+      context: ./web/client
+    image: gigaam-recogn2-web:latest
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - web-api
+
+volumes:
+  mongo_data:
+
