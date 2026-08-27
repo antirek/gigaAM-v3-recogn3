@@ -182,6 +182,30 @@ CPU возможен только как fallback / ручной `DEVICE=cpu` (�
 - опциональный `extract-hybrid` тянет GLiNER (`fulstock/gliner-nerel-finetuned`) отдельно и в основной дневной путь **не входит**.
 - железная цель пайплайна: **RTX 5060 Ti 16 GB**.
 
+### Альтернатива ASR: Vosk vs GigaAM (не берём в прод)
+
+Технически Vosk можно подставить **вместо GigaAM** в шаг `asr` (Sortformer остаётся). Для нашего офлайн-батча RU-телефонии (**шум, кодек, IVR/hold, имена/номера → LLM summary**) оставляем **GigaAM**.
+
+| | **GigaAM v3_e2e_rnnt** (сейчас) | **Vosk** (ru-модели) |
+|--|--------------------------------|----------------------|
+| Архитектура | e2e RNNT (~220–240M) | Kaldi / Zipformer (зависит от версии модели) |
+| Устройство | **GPU** (~1–2 GB VRAM) | в основном **CPU** |
+| Режим | офлайн по diar-чанкам | сильная сторона — **streaming** |
+| Пунктуация | из коробки (e2e) | слабее / отдельно |
+| Диск | ~0.45 GB | ~50 MB (small) … ~1 GB+ (large) |
+| Diarization | нет (Sortformer отдельно) | нет (тоже нужен внешний diar) |
+
+**Почему не меняем:**
+- на **чистой** речи Vosk иногда близок к GigaAM; на **шумных / телефонных** данных деградация у Vosk сильнее ([оценка RU ASR на clean vs noisy](https://science-engineering.ru/en/article/view?id=1514));
+- на доменах колл-центра / OpenSTT-calls GigaAM обычно **лучше** Vosk small/large ([T-one vs GigaAM / Vosk на Хабре](https://habr.com/ru/companies/tbank/articles/929850/));
+- обзорный разбор для бизнеса: [GigaAM или Vosk](https://llacot.ru/press/gigaam-ili-vosk/) — GigaAM как более робастный к «полевым» условиям;
+- downstream (extract / summary / escalation) чувствителен к ошибкам ASR на именах, номерах, терминах — экономия VRAM не окупает падение текста.
+
+**Когда Vosk имел бы смысл:** live/streaming, edge без GPU, грубый черновик (есть ли речь / keyword).  
+**Когда ускорять recognize:** не откат на Vosk, а warm workers / staged batch (см. ниже) — bottleneck у нас в cold-start Docker, не в «тяжёлом» GigaAM.
+
+Перед сменой ASR нужен A/B на `tests/regression/golden` + выборке реальных звонков (на глаз / entity errors; честный WER — только с ручным reference).
+
 ## Пост-обработка текста (LLM/LLM-free извлечение фактов)
 
 После `recognize.py` у нас уже есть `out/<id>/transcript.txt` в формате:
@@ -419,6 +443,20 @@ data/calls/<tag>/*.mp3
 Артефакты:
 - `data/calls/io_answered_gt30_2026-08-21/`
 - `out/io_answered_gt30_2026-08-21/` + `_METRICS.md`
+
+#### Возможное улучшение: ускорение `recognize` (параллель / warm workers)
+
+Сейчас `recognize.py` на каждый звонок делает `docker-compose run --rm` для **diar** и **asr** → холодный старт контейнера и **полная загрузка** Sortformer / GigaAM. На батче 21.08 median ~27 с/звонок при малых весах на диске (~0.5 + 0.45 GB): wall-clock ест в основном **load + docker**, не inference. Веса «маленькие» ≠ безопасный пик VRAM процесса (PyTorch/NeMo, CUDA context, длинные файлы). `llamacpp` (~10 GB) на время recognize по-прежнему нужно **останавливать**.
+
+| Вариант | Суть | Плюсы | Минусы / риск на 16 GB | Ожидание |
+|---------|------|-------|------------------------|----------|
+| **A. Хостовый fan-out** | `xargs -P N` / GNU parallel над текущим `recognize.py` | минимум кода | cold-start ×N; OOM без лимита; не ×N к скорости | эксперимент с **N=2…3**, не 5 |
+| **B. Fan-out + GPU-семафор** | очередь звонков, лимит одновременных diar/ASR (напр. ≤2+≤2) | контролируемый VRAM | всё ещё ephemeral `run --rm` | разумный компромисс без смены архитектуры |
+| **C. Persistent workers** (целевой) | долгоживущие diar/asr HTTP (модель один раз), оркестратор шлёт jobs | убирает главный тормоз; стабильный VRAM | 0.5–2 дня (API, очередь, правка `_run_diar` / `_asr_pass`) | даже 1 warm worker: десятки мин → порядка **15–25 мин** на похожем батче |
+| **D. Двухстадийный batch** | все diar (тёплый) → большой ASR-manifest → точечный transfer-split | хорошо ложится на `asr --manifest` | ломает «один проход = один out-dir» | сильный вариант рядом с C |
+| **E. Несколько копий модели в VRAM** | 2–3 GigaAM в одном процессе | max parallel inference | сложно, OOM на длинных; рано, пока bottleneck = load | после C/D |
+
+**Практика:** не стартовать с `-P 5` на RTX 5060 Ti 16 GB; сначала `-P 2` + замер peak `nvidia-smi` и fail rate. Для «в разы быстрее» нужен не thread count, а **warm workers (C)** или **staged batch (D)**; высокий параллелизм имеет смысл уже на тёплых воркерах с жёстким лимитом concurrent GPU jobs.
 
 Ограничение качества:
 - narrative «о чём день» обычно ок;
